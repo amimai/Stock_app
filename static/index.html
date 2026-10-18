@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stock_app — ML_stock Forecast &amp; Screening Terminal</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- Top Navigation & Global Action Bar -->
+  <header class="topbar">
+    <div class="topbar-brand" id="navHomeBtn" title="Return to Main Dashboard">
+      <div class="brand-logo">ML</div>
+      <div>
+        <div class="brand-title">Stock_app <span class="brand-badge">PatchTST Quantile Terminal</span></div>
+        <div class="brand-subtitle" id="systemStatusLine">Connecting to ML_stock...</div>
+      </div>
+    </div>
+
+    <!-- Global Quick Search for Parquet Memory -->
+    <div class="topbar-search">
+      <input
+        type="text"
+        id="globalSearchInput"
+        placeholder="Search Parquet memory (e.g. NVDA, AAPL, ^GSPC, Semiconductor)..."
+        autocomplete="off"
+      />
+      <div id="globalSearchDropdown" class="search-dropdown hidden"></div>
+    </div>
+
+    <div class="topbar-actions">
+      <button class="btn btn-secondary" id="btnNavDashboard">Main Dashboard</button>
+      <button class="btn btn-secondary" id="btnOpenScreenModal">Run Market Screen</button>
+      <button class="btn btn-primary" id="btnOpenPredictModal">+ Run Stock Prediction</button>
+    </div>
+  </header>
+
+  <!-- Main Content Container -->
+  <main class="main-container">
+    <!-- ==================== VIEW 1: MAIN DASHBOARD ==================== -->
+    <section id="dashboardView" class="view-section">
+      <!-- KPI Summary Strip -->
+      <div class="kpi-strip">
+        <div class="kpi-card">
+          <div class="kpi-label">Tracked Stocks (Predictions / Hits)</div>
+          <div class="kpi-value" id="kpiTrackedStocks">0</div>
+          <div class="kpi-sub">Active in Stock_app DB</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Specific Prediction Calls</div>
+          <div class="kpi-value" id="kpiManualPreds">0</div>
+          <div class="kpi-sub" id="kpiTotalPredsSub">0 total stored cones</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Market Screening Calls</div>
+          <div class="kpi-value" id="kpiScreenRuns">0</div>
+          <div class="kpi-sub" id="kpiScreenHitsSub">0 screen hit records</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">ML_stock Parquet Memory</div>
+          <div class="kpi-value" id="kpiParquetCount">0</div>
+          <div class="kpi-sub" id="kpiModelArchSub">PatchTST Checkpoint</div>
+        </div>
+      </div>
+
+      <!-- Main Two-Column Grid: Left = Tracked Stocks & Parquet Explorer, Right = Call Histories -->
+      <div class="dashboard-grid">
+        <!-- Left Column -->
+        <div class="dashboard-col">
+          <!-- 1) List of all stocks with current predictions or screen hits -->
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">1. Stocks with Predictions &amp; Screen Hits</h2>
+                <p class="panel-desc">Click any stock to inspect its market chart, historical predictions side menu, and probability cones.</p>
+              </div>
+              <div class="panel-controls">
+                <select id="trackedFilterSelect" class="input-select">
+                  <option value="all">All Sources</option>
+                  <option value="manual">Manual Predictions</option>
+                  <option value="screen">Screen Hits</option>
+                  <option value="bullish">Bullish Hits</option>
+                  <option value="bearish">Bearish Hits</option>
+                  <option value="volatility">Volatility Plays</option>
+                  <option value="index">Aggregate Indexes</option>
+                </select>
+                <input type="text" id="trackedSearchInput" class="input-sm" placeholder="Filter list..." />
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table" id="trackedStocksTable">
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
+                    <th>Name / Sector</th>
+                    <th>Predictions / Hits</th>
+                    <th>Latest Anchor</th>
+                    <th>Last Close</th>
+                    <th>2d Median (50%)</th>
+                    <th>80% Range [10%–90%]</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="trackedStocksTbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 2) Search box for specific stocks in ML_stock Parquet Memory -->
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">2. ML_stock Parquet Memory Explorer</h2>
+                <p class="panel-desc">Search all cached tickers in <code>ML_stock/data/raw</code> to inspect in detail or run new predictions.</p>
+              </div>
+              <div class="panel-controls">
+                <select id="parquetUniverseSelect" class="input-select">
+                  <option value="all">All Universes</option>
+                  <option value="sp500">S&amp;P 500</option>
+                  <option value="nasdaq100">Nasdaq-100</option>
+                  <option value="ftse100">FTSE 100</option>
+                  <option value="dax40">DAX 40</option>
+                  <option value="nikkei225">Nikkei 225</option>
+                  <option value="kospi200">KOSPI 200</option>
+                  <option value="indexes">Global Indexes</option>
+                </select>
+                <input type="text" id="parquetSearchInput" class="input-sm" placeholder="Search ticker, company, sector..." />
+                <button class="btn btn-sm btn-secondary" id="btnParquetSearch">Search</button>
+              </div>
+            </div>
+            <div class="table-wrap table-scroll-md">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
+                    <th>Company / Index Name</th>
+                    <th>Sector</th>
+                    <th>Universe</th>
+                    <th>Stored Predictions</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="parquetSearchTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Column: History of Every Screening Call & Specific Prediction Call -->
+        <div class="dashboard-col">
+          <div class="panel">
+            <div class="panel-header">
+              <div class="tabs-bar">
+                <button class="tab-btn active" data-tab="tabScreeningHistory">Screening Call History</button>
+                <button class="tab-btn" data-tab="tabPredictionHistory">Specific Prediction Call History</button>
+              </div>
+              <div class="panel-controls">
+                <button class="btn btn-sm btn-primary" id="btnQuickRunScreen">+ New Screen</button>
+              </div>
+            </div>
+
+            <!-- Tab 1: Screening Calls History -->
+            <div id="tabScreeningHistory" class="tab-pane active">
+              <div id="screeningHistoryList" class="history-card-list"></div>
+            </div>
+
+            <!-- Tab 2: Specific Prediction Calls History -->
+            <div id="tabPredictionHistory" class="tab-pane hidden">
+              <div class="subfilter-bar">
+                <span class="muted-label">Filter call source:</span>
+                <select id="predHistorySourceSelect" class="input-select">
+                  <option value="all">All Stored Predictions (Manual + Screen)</option>
+                  <option value="manual">Manual Stock Prediction Calls Only</option>
+                  <option value="screen">Screen Hit Predictions Only</option>
+                </select>
+              </div>
+              <div class="table-wrap table-scroll-lg">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Timestamp (UTC)</th>
+                      <th>Ticker</th>
+                      <th>Source</th>
+                      <th>Anchor Date</th>
+                      <th>Anchor Px</th>
+                      <th>2d Med</th>
+                      <th>20d Med</th>
+                      <th>Inspect</th>
+                    </tr>
+                  </thead>
+                  <tbody id="predHistoryTbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Active Screening Call Inspector Panel (when a screening run is clicked) -->
+          <div id="screenRunInspectorPanel" class="panel hidden">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title" id="screenInspectorTitle">Screening Call Details</h2>
+                <p class="panel-desc" id="screenInspectorMeta"></p>
+              </div>
+              <div class="panel-controls">
+                <button class="btn btn-sm btn-secondary" id="btnCloseScreenInspector">Close</button>
+              </div>
+            </div>
+            <div class="tabs-bar sub-tabs">
+              <button class="subtab-btn active" data-screentab="bullish">Top Bullish</button>
+              <button class="subtab-btn" data-screentab="bearish">Top Bearish</button>
+              <button class="subtab-btn" data-screentab="volatility">Top Volatility</button>
+              <button class="subtab-btn" data-screentab="indexes">Global Indexes</button>
+            </div>
+            <div class="table-wrap table-scroll-md">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
+                    <th>Name</th>
+                    <th>Last Px</th>
+                    <th>1d (50%)</th>
+                    <th>2d (50%)</th>
+                    <th>80% Range [10%–90%]</th>
+                    <th>20d (50%)</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="screenInspectorTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== VIEW 2: SELECTED STOCK DETAIL VIEW ==================== -->
+    <section id="stockDetailView" class="view-section hidden">
+      <!-- Stock Header Bar -->
+      <div class="stock-header-bar">
+        <div class="stock-header-left">
+          <button class="btn btn-sm btn-secondary" id="btnBackToDashboard">&larr; Back to Dashboard</button>
+          <div class="stock-Identity">
+            <div class="stock-ticker-row">
+              <h1 id="detailTickerTitle">NVDA</h1>
+              <span class="badge badge-universe" id="detailUniverseBadge">sp500</span>
+              <span class="badge badge-sector" id="detailSectorBadge">Information Technology</span>
+            </div>
+            <div class="stock-name-sub" id="detailCompanyName">NVIDIA Corporation</div>
+          </div>
+          <div class="stock-price-box">
+            <div class="stock-latest-price" id="detailLatestPrice">$0.00</div>
+            <div class="stock-latest-change" id="detailLatestChange">--</div>
+            <div class="stock-latest-date" id="detailLatestDate">Last bar: --</div>
+          </div>
+        </div>
+
+        <!-- Stock Action Controls: Run Prediction, Historical As-Of Date, Refresh via data_loader.py -->
+        <div class="stock-header-actions">
+          <div class="inline-predict-form">
+            <label for="detailAsOfDate" class="form-label-inline" title="Leave blank for latest bar, or pick a past date to test how the model's cone performed against actual subsequent prices">
+              Point-in-Time Date:
+            </label>
+            <input type="date" id="detailAsOfDate" class="input-sm" title="Optional historical anchor date" />
+            <label for="detailNumSamples" class="form-label-inline">Samples:</label>
+            <select id="detailNumSamples" class="input-select">
+              <option value="1">1 (Fast)</option>
+              <option value="5">5 Ensemble</option>
+              <option value="15">15 Ensemble</option>
+            </select>
+            <label class="checkbox-inline" title="Enable Monte Carlo Dropout">
+              <input type="checkbox" id="detailMcDropout" /> MC Dropout
+            </label>
+            <button class="btn btn-primary" id="btnRunStockPredictNow">Run Prediction</button>
+          </div>
+          <button class="btn btn-secondary" id="btnRefreshStockCache" title="Call ML_stock/src/data_loader.py to update cached Parquet data for this ticker">
+            Update Cache (data_loader.py)
+          </button>
+        </div>
+      </div>
+
+      <!-- Main Stock Detail Layout: Center/Left Charts + Right Side Menu of Previous Predictions -->
+      <div class="stock-detail-layout">
+        <!-- Charts & Evaluation Column -->
+        <div class="stock-charts-col">
+          <!-- CHART 1: Current Market Chart with Prediction Cone Overlay -->
+          <div class="panel chart-panel">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">Market Chart &amp; Prediction Band Overlay</h2>
+                <p class="panel-desc" id="marketChartSubtitle">
+                  Click any prediction in the right-hand side menu to overlay its probability cone bands onto the market chart.
+                </p>
+              </div>
+              <div class="panel-controls">
+                <div class="btn-group">
+                  <button class="btn btn-xs active" data-range="90">3M</button>
+                  <button class="btn btn-xs" data-range="180">6M</button>
+                  <button class="btn btn-xs" data-range="320">1Y+</button>
+                </div>
+                <div class="btn-group">
+                  <button class="btn btn-xs active" id="btnChartModeCandle">Candles</button>
+                  <button class="btn btn-xs" id="btnChartModeLine">Close Line</button>
+                </div>
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="chkShowAllCones" /> Overlay All Stored Cones
+                </label>
+              </div>
+            </div>
+            <div class="canvas-container">
+              <canvas id="marketChartCanvas" height="400"></canvas>
+            </div>
+            <div class="chart-legend">
+              <span class="legend-item"><span class="swatch swatch-candle-up"></span> Market Price (OHLC)</span>
+              <span class="legend-item"><span class="swatch swatch-median"></span> Predicted Median (50%)</span>
+              <span class="legend-item"><span class="swatch swatch-band50"></span> 50% Core Band [25%–75%]</span>
+              <span class="legend-item"><span class="swatch swatch-band80"></span> 80% Standard Band [10%–90%]</span>
+              <span class="legend-item"><span class="swatch swatch-band90"></span> 90% Tail Band [5%–95%]</span>
+              <span class="legend-item"><span class="swatch swatch-anchor"></span> Prediction Anchor Date</span>
+            </div>
+          </div>
+
+          <!-- CHART 2: Point-in-Time Probability Cone vs Realized Subsequent Price Trajectory -->
+          <div class="panel chart-panel" id="focusedConePanel">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">Point-in-Time Probability Cone vs. Realized Price Trajectory</h2>
+                <p class="panel-desc" id="coneChartSubtitle">
+                  Shows the model's forecast probability cone at the exact date the prediction was made alongside what the stock price actually did since then.
+                </p>
+              </div>
+              <div class="panel-controls">
+                <div class="btn-group">
+                  <button class="btn btn-xs active" id="btnConeUnitPrice">Price ($)</button>
+                  <button class="btn btn-xs" id="btnConeUnitReturn">Cumulative Return (%)</button>
+                </div>
+              </div>
+            </div>
+            <div class="canvas-container">
+              <canvas id="coneChartCanvas" height="340"></canvas>
+            </div>
+
+            <!-- Milestone Realized vs Predicted Comparison Table -->
+            <div class="milestone-eval-wrap">
+              <h3 class="sub-heading" id="milestoneTableHeading">Milestone Quantile Forecast &amp; Realized Performance</h3>
+              <div class="table-wrap">
+                <table class="data-table" id="milestoneEvalTable">
+                  <thead>
+                    <tr>
+                      <th>Horizon</th>
+                      <th>Target Date</th>
+                      <th>Median Forecast (50%)</th>
+                      <th>50% Core [25%–75%]</th>
+                      <th>80% Band [10%–90%]</th>
+                      <th>90% Tail [5%–95%]</th>
+                      <th>Realized Actual Close</th>
+                      <th>Realized Return</th>
+                      <th>Band / Direction Hit</th>
+                    </tr>
+                  </thead>
+                  <tbody id="milestoneEvalTbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Side Menu: Previous Predictions Made on Selected Stock -->
+        <aside class="predictions-sidemenu panel">
+          <div class="sidemenu-header">
+            <div>
+              <h2 class="panel-title">Previous Predictions</h2>
+              <p class="panel-desc">Click a prediction to overlay its probability bands onto the chart.</p>
+            </div>
+            <span class="badge badge-count" id="stockPredCountBadge">0</span>
+          </div>
+          <div id="stockPredictionsMenu" class="sidemenu-list"></div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <!-- ==================== MODAL: RUN MARKET SCREENING ==================== -->
+  <div id="screenModal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Run ML_stock Market Screener</h3>
+        <button class="btn-close" id="btnCloseScreenModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">
+          Runs batched GPU/CPU PatchTST quantile inference across the selected universe and stores both the screening call summary and individual probability cones for top hits.
+        </p>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Target Universe</label>
+            <select id="modalScreenUniverse" class="input-select full-width">
+              <option value="all">All Universes + Local Parquet Memory</option>
+              <option value="sp500">S&amp;P 500 (US Large Cap)</option>
+              <option value="nasdaq100">Nasdaq-100 (US Tech / Growth)</option>
+              <option value="ftse100">FTSE 100 (UK)</option>
+              <option value="dax40">DAX 40 (Germany)</option>
+              <option value="nikkei225">Nikkei 225 (Japan)</option>
+              <option value="kospi200">KOSPI 200 (South Korea)</option>
+              <option value="indexes">Global Aggregate Indexes Only</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Top N Ranked per Category</label>
+            <input type="number" id="modalScreenTopN" class="input-sm full-width" value="10" min="1" max="50" />
+          </div>
+          <div class="form-group">
+            <label>Minimum Stock Price ($)</label>
+            <input type="number" id="modalScreenMinPrice" class="input-sm full-width" value="5.0" step="0.5" min="0" />
+          </div>
+          <div class="form-group checkbox-group">
+            <label class="checkbox-inline">
+              <input type="checkbox" id="modalScreenSaveAll" />
+              Save predictions for all screened stocks (not just top hits)
+            </label>
+            <label class="checkbox-inline">
+              <input type="checkbox" id="modalScreenRefreshData" />
+              Update Parquet cache via <code>data_loader.py</code> before screening
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="btnCancelScreenModal">Cancel</button>
+        <button class="btn btn-primary" id="btnSubmitScreenModal">Run Screening Call</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: RUN SPECIFIC STOCK PREDICTION ==================== -->
+  <div id="predictModal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Run Specific Stock Prediction</h3>
+        <button class="btn-close" id="btnClosePredictModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">
+          Runs PatchTST multi-horizon quantile forecasting on a specific ticker and stores the resulting probability cone in Stock_app's database.
+        </p>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Ticker Symbol</label>
+            <input type="text" id="modalPredictTicker" class="input-sm full-width" placeholder="e.g. NVDA, AAPL, MSFT, ^GSPC" />
+          </div>
+          <div class="form-group">
+            <label>Point-in-Time Anchor Date (Optional — leave blank for latest)</label>
+            <input type="date" id="modalPredictAsOfDate" class="input-sm full-width" />
+          </div>
+          <div class="form-group">
+            <label>Ensemble Samples</label>
+            <select id="modalPredictSamples" class="input-select full-width">
+              <option value="1">1 (Deterministic Single Pass)</option>
+              <option value="5">5 Samples (Context Resampling)</option>
+              <option value="15">15 Samples (Full Uncertainty Cone)</option>
+            </select>
+          </div>
+          <div class="form-group checkbox-group">
+            <label class="checkbox-inline">
+              <input type="checkbox" id="modalPredictMcDropout" />
+              Enable Monte Carlo Dropout during inference
+            </label>
+            <label class="checkbox-inline">
+              <input type="checkbox" id="modalPredictRefreshData" />
+              Update Parquet data via <code>data_loader.py</code> before predicting
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="btnCancelPredictModal">Cancel</button>
+        <button class="btn btn-primary" id="btnSubmitPredictModal">Run &amp; Store Prediction</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script src="/static/charts.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
