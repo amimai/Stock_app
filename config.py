@@ -36,6 +36,13 @@ ML_STOCK_CHECKPOINT: Path = Path(
     )
 ).resolve()
 
+ML_STOCK_CHECKPOINTS_DIR: Path = Path(
+    os.environ.get(
+        "ML_STOCK_CHECKPOINTS_DIR",
+        str(ML_STOCK_DIR / "checkpoints"),
+    )
+).resolve()
+
 # Stock_app internal database path
 DATA_DIR: Path = APP_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)

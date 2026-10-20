@@ -128,6 +128,38 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
+    def _validate_csrf(self) -> bool:
+        """Validates Origin or Host header on state-changing requests to mitigate CSRF."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        if origin == "null":
+            return False
+
+        parsed_origin = urlparse(origin)
+        origin_host = parsed_origin.netloc.lower()
+        if not origin_host:
+            return False
+
+        host_hdr = (self.headers.get("Host") or "").strip().lower()
+        if not host_hdr:
+            return True
+
+        if origin_host == host_hdr:
+            return True
+
+        origin_hostname = parsed_origin.hostname.lower() if parsed_origin.hostname else ""
+        host_hostname = host_hdr.split(":")[0].lower()
+        origin_port = parsed_origin.port
+        host_port = int(host_hdr.split(":")[1]) if ":" in host_hdr else None
+
+        loopbacks = {"127.0.0.1", "localhost", "::1"}
+        if origin_hostname in loopbacks and host_hostname in loopbacks:
+            if origin_port == host_port or (origin_port is None and host_port in (80, 443)):
+                return True
+
+        return False
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -142,20 +174,43 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
 
             if path == "/api/overview":
                 source_filter = qs.get("source", ["all"])[0]
+                model_run = qs.get("model_run", ["all"])[0]
                 return self._send_json(
                     {
                         "ok": True,
                         "status": bridge.get_system_status(),
-                        "tracked_stocks": db.get_tracked_stocks(),
+                        "active_run_id": bridge.active_run_id,
+                        "tracked_stocks": db.get_tracked_stocks(model_run=model_run),
                         "prediction_history": db.get_prediction_history(
                             limit=int(qs.get("pred_limit", ["150"])[0]),
                             source=source_filter,
+                            model_run=model_run,
                         ),
                         "screening_history": db.get_screening_history(
-                            limit=int(qs.get("screen_limit", ["50"])[0])
+                            limit=int(qs.get("screen_limit", ["50"])[0]),
+                            model_run=model_run,
                         ),
+                        "counts": db.get_counts(model_run=model_run),
                     }
                 )
+
+            if path == "/api/models":
+                models = bridge.list_available_models()
+                return self._send_json(
+                    {
+                        "ok": True,
+                        "models": models,
+                        "active_run_id": bridge.active_run_id,
+                        "count": len(models),
+                    }
+                )
+
+            if path.startswith("/api/models/"):
+                run_id = unquote(path[len("/api/models/") :]).strip()
+                detail = bridge.get_model_detail(run_id)
+                if not detail.get("ok", True):
+                    return self._send_json(detail, status=HTTPStatus.NOT_FOUND)
+                return self._send_json(detail)
 
             if path == "/api/parquet/search":
                 q = qs.get("q", [""])[0]
@@ -170,13 +225,21 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
                 ticker = unquote(path[len("/api/stock/") :]).strip().upper()
                 bars_limit = int(qs.get("bars", ["360"])[0])
                 auto_fetch = qs.get("auto_fetch", ["0"])[0] in ("1", "true", "yes")
+                model_run = qs.get("model_run", ["all"])[0]
                 detail = bridge.get_stock_detail(
-                    ticker=ticker, bars_limit=bars_limit, auto_fetch=auto_fetch
+                    ticker=ticker,
+                    bars_limit=bars_limit,
+                    auto_fetch=auto_fetch,
+                    model_run=model_run,
                 )
                 return self._send_json({"ok": True, "stock": detail})
 
             if path.startswith("/api/screen/"):
-                run_id = int(path[len("/api/screen/") :])
+                raw_id = path[len("/api/screen/") :]
+                try:
+                    run_id = int(raw_id)
+                except ValueError:
+                    return self._send_error_json("Invalid ID format", status=HTTPStatus.BAD_REQUEST)
                 run_data = db.get_screening_run(run_id)
                 if not run_data:
                     return self._send_error_json(
@@ -185,7 +248,11 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "screening_run": run_data})
 
             if path.startswith("/api/prediction/"):
-                pred_id = int(path[len("/api/prediction/") :])
+                raw_id = path[len("/api/prediction/") :]
+                try:
+                    pred_id = int(raw_id)
+                except ValueError:
+                    return self._send_error_json("Invalid ID format", status=HTTPStatus.BAD_REQUEST)
                 pred = db.get_prediction_by_id(pred_id)
                 if not pred:
                     return self._send_error_json(
@@ -206,8 +273,26 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
+        if not self._validate_csrf():
+            return self._send_error_json(
+                "CSRF check failed: invalid Origin header", status=HTTPStatus.FORBIDDEN
+            )
+
         try:
             body = self._read_json_body()
+
+            if path == "/api/models/select":
+                run_id = str(body.get("run_id", "")).strip()
+                if not run_id:
+                    return self._send_error_json("Field 'run_id' is required.")
+                promote = bool(body.get("promote_to_root", False))
+                try:
+                    res = bridge.set_active_model(run_id=run_id, promote_to_root=promote)
+                    return self._send_json(res)
+                except FileNotFoundError as exc:
+                    return self._send_error_json(str(exc), status=HTTPStatus.NOT_FOUND)
+                except ValueError as exc:
+                    return self._send_error_json(str(exc), status=HTTPStatus.BAD_REQUEST)
 
             if path == "/api/predict":
                 ticker = str(body.get("ticker", "")).strip().upper()
@@ -220,6 +305,9 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
                 mc_dropout = bool(body.get("mc_dropout", False))
                 market_resampling = bool(body.get("market_resampling", True))
                 refresh_data = bool(body.get("refresh_data", False))
+                model_run = body.get("model_run")
+                if model_run:
+                    model_run = str(model_run).strip()
 
                 pred = bridge.run_stock_prediction(
                     ticker=ticker,
@@ -228,6 +316,7 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
                     mc_dropout=mc_dropout,
                     market_resampling=market_resampling,
                     refresh_data=refresh_data,
+                    model_run=model_run,
                 )
                 return self._send_json({"ok": True, "prediction": pred})
 
@@ -237,6 +326,9 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
                 min_price = float(body.get("min_price", 5.0))
                 refresh_data = bool(body.get("refresh_data", False))
                 save_all = bool(body.get("save_all_screened", False))
+                model_run = body.get("model_run")
+                if model_run:
+                    model_run = str(model_run).strip()
 
                 run_data = bridge.run_market_screening(
                     universe=universe,
@@ -244,6 +336,7 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
                     min_price=min_price,
                     refresh_data=refresh_data,
                     save_all_screened=save_all,
+                    model_run=model_run,
                 )
                 return self._send_json({"ok": True, "screening_run": run_data})
 
@@ -258,6 +351,12 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "result": res})
 
             self._send_error_json(f"Unknown POST endpoint: {path}", status=HTTPStatus.NOT_FOUND)
+        except FileNotFoundError as exc:
+            logger.error("POST %s not found: %s", path, exc)
+            self._send_error_json(str(exc), status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            logger.error("POST %s bad request: %s", path, exc)
+            self._send_error_json(str(exc), status=HTTPStatus.BAD_REQUEST)
         except Exception as exc:
             logger.error("POST %s failed: %s", path, exc)
             self._send_error_json(
@@ -269,18 +368,34 @@ class StockAppRequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+
+        if not self._validate_csrf():
+            return self._send_error_json(
+                "CSRF check failed: invalid Origin header", status=HTTPStatus.FORBIDDEN
+            )
+
         try:
             if path.startswith("/api/prediction/"):
-                pred_id = int(path[len("/api/prediction/") :])
+                raw_id = path[len("/api/prediction/") :]
+                try:
+                    pred_id = int(raw_id)
+                except ValueError:
+                    return self._send_error_json("Invalid ID format", status=HTTPStatus.BAD_REQUEST)
                 deleted = db.delete_prediction(pred_id)
                 return self._send_json({"ok": True, "deleted": deleted})
 
             if path.startswith("/api/screen/"):
-                run_id = int(path[len("/api/screen/") :])
+                raw_id = path[len("/api/screen/") :]
+                try:
+                    run_id = int(raw_id)
+                except ValueError:
+                    return self._send_error_json("Invalid ID format", status=HTTPStatus.BAD_REQUEST)
                 deleted = db.delete_screening_run(run_id)
                 return self._send_json({"ok": True, "deleted": deleted})
 
             self._send_error_json(f"Unknown DELETE endpoint: {path}", status=HTTPStatus.NOT_FOUND)
+        except ValueError:
+            self._send_error_json("Invalid ID format", status=HTTPStatus.BAD_REQUEST)
         except Exception as exc:
             self._send_error_json(str(exc), status=HTTPStatus.INTERNAL_SERVER_ERROR)
 

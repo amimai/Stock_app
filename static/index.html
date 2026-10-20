@@ -28,8 +28,15 @@
       <div id="globalSearchDropdown" class="search-dropdown hidden"></div>
     </div>
 
+    <!-- Active Model Checkpoint Selector -->
+    <div class="topbar-model-wrap">
+      <label for="globalModelSelect" class="topbar-model-label">🤖 Active Model:</label>
+      <select id="globalModelSelect" class="input-select input-sm" title="Active Model Checkpoint for predictions &amp; screening"></select>
+    </div>
+
     <div class="topbar-actions">
-      <button class="btn btn-secondary" id="btnNavDashboard">Main Dashboard</button>
+      <button class="btn btn-secondary active" id="btnNavDashboard" title="Forecast &amp; Screening Terminal">📊 Dashboard</button>
+      <button class="btn btn-secondary" id="btnNavModelRuns" title="Model Runs &amp; Benchmarks Explorer">🔬 Model Runs</button>
       <button class="btn btn-secondary" id="btnOpenScreenModal">Run Market Screen</button>
       <button class="btn btn-primary" id="btnOpenPredictModal">+ Run Stock Prediction</button>
     </div>
@@ -70,11 +77,24 @@
           <!-- 1) List of all stocks with current predictions or screen hits -->
           <div class="panel">
             <div class="panel-header">
-              <div>
-                <h2 class="panel-title">1. Stocks with Predictions &amp; Screen Hits</h2>
+              <div class="panel-header-title-group">
+                <h2 class="panel-title">1. Stocks with Predictions &amp; Screen Hits <span id="trackedFilterCountBadge" class="badge badge-universe tracked-count-badge"></span></h2>
                 <p class="panel-desc">Click any stock to inspect its market chart, historical predictions side menu, and probability cones.</p>
               </div>
               <div class="panel-controls">
+                <div class="btn-group toggle-group horizon-pills-group" id="trackedHorizonToggle" role="group" aria-label="Forecast Horizon">
+                  <button type="button" class="btn btn-xs" data-horizon="1d" title="1-day forecast milestone">1d</button>
+                  <button type="button" class="btn btn-xs active" data-horizon="2d" title="2-day forecast milestone">2d</button>
+                  <button type="button" class="btn btn-xs" data-horizon="5d" title="5-day forecast milestone">5d</button>
+                  <button type="button" class="btn btn-xs" data-horizon="20d" title="20-day forecast milestone">20d</button>
+                </div>
+                <div class="btn-group toggle-group" id="trackedModeToggle" role="group" aria-label="Analysis Mode">
+                  <button type="button" class="btn btn-xs active" id="btnModeDirectional" title="Directional Plays (Focus on Median % return and direction)">🎯 Directional</button>
+                  <button type="button" class="btn btn-xs" id="btnModeVolatility" title="Volatility Plays (Focus on prediction band ranges, combined % spread, and expected moves)">⚡ Volatility</button>
+                </div>
+                <select id="trackedModelFilterSelect" class="input-select" title="Filter by Model Checkpoint">
+                  <option value="all">All Models</option>
+                </select>
                 <select id="trackedFilterSelect" class="input-select">
                   <option value="all">All Sources</option>
                   <option value="manual">Manual Predictions</option>
@@ -87,18 +107,99 @@
                 <input type="text" id="trackedSearchInput" class="input-sm" placeholder="Filter list..." />
               </div>
             </div>
-            <div class="table-wrap">
-              <table class="data-table" id="trackedStocksTable">
+            <div class="table-wrap table-scroll-panel1">
+              <table class="data-table table-fixed" id="trackedStocksTable">
+                <colgroup>
+                  <col style="width: 7%; min-width: 65px;" />
+                  <col style="width: 11%; min-width: 95px;" />
+                  <col style="width: 9%; min-width: 85px;" />
+                  <col style="width: 9%; min-width: 85px;" />
+                  <col style="width: 10%; min-width: 95px;" />
+                  <col style="width: 8%; min-width: 75px;" />
+                  <col style="width: 7%; min-width: 65px;" />
+                  <col style="width: 16%; min-width: 145px;" id="colTrackedMetric" />
+                  <col style="width: 13%; min-width: 115px;" id="colTrackedRange" />
+                  <col style="width: 10%; min-width: 90px;" />
+                </colgroup>
                 <thead>
-                  <tr>
+                  <tr class="header-titles">
                     <th>Ticker</th>
-                    <th>Name / Sector</th>
+                    <th>Name</th>
+                    <th>Sector</th>
+                    <th>Model Run</th>
                     <th>Predictions / Hits</th>
                     <th>Latest Anchor</th>
                     <th>Last Close</th>
-                    <th>2d Median (50%)</th>
-                    <th>80% Range [10%–90%]</th>
+                    <th id="thTracked2dMedian" class="th-sortable" title="Click to toggle sort">
+                      <div class="th-sort-wrapper">
+                        <span id="thTrackedMetricTitle">2d Median (50%)</span>
+                        <span id="sortIndicator2d" class="sort-icon">⇅</span>
+                      </div>
+                    </th>
+                    <th id="thTrackedRangeTitle">80% Range [10%–90%]</th>
                     <th>Actions</th>
+                  </tr>
+                  <tr class="table-filter-row">
+                    <th>
+                      <input type="text" id="filterTrackedTicker" class="col-filter-input" placeholder="Search ticker..." autocomplete="off" />
+                    </th>
+                    <th>
+                      <input type="text" id="filterTrackedName" class="col-filter-input" placeholder="Search name..." autocomplete="off" />
+                    </th>
+                    <th>
+                      <select id="filterTrackedSector" class="col-filter-select" title="Filter by sector">
+                        <option value="all">All Sectors</option>
+                      </select>
+                    </th>
+                    <th>
+                      <select id="filterTrackedModel" class="col-filter-select" title="Filter by model run">
+                        <option value="all">All Models</option>
+                      </select>
+                    </th>
+                    <th>
+                      <select id="filterTrackedPredsHits" class="col-filter-select" title="Filter by predictions or screen hit values">
+                        <option value="all">All Values</option>
+                      </select>
+                    </th>
+                    <th>
+                      <select id="filterTrackedAnchorDate" class="col-filter-select" title="Filter by anchor date">
+                        <option value="all">All Dates</option>
+                      </select>
+                    </th>
+                    <th class="filter-empty"><span class="text-muted" style="font-size:11px;">—</span></th>
+                    <th>
+                      <div class="col-filter-2d-box">
+                        <div class="filter-controls-inline">
+                          <select id="filterTracked2dRange" class="col-filter-select" title="Filter by return range">
+                            <option value="all">All Ranges</option>
+                            <option value="0.5_1.0">0.50% to 1.00%</option>
+                            <option value="pos">Positive (&gt; 0%)</option>
+                            <option value="neg">Negative (&lt; 0%)</option>
+                            <option value="gt_2">&gt; +2.00%</option>
+                            <option value="1.0_2.0">+1.00% to +2.00%</option>
+                            <option value="0.0_0.5">0.00% to +0.50%</option>
+                            <option value="m0.5_0.0">-0.50% to 0.00%</option>
+                            <option value="m1.0_m0.5">-1.00% to -0.50%</option>
+                            <option value="lt_m1">&lt; -1.00%</option>
+                            <option value="custom">Custom Range...</option>
+                          </select>
+                          <select id="filterTracked2dSort" class="col-filter-select" title="Sort by Median return">
+                            <option value="none">Sort: Default</option>
+                            <option value="desc">Sort: High → Low (Desc)</option>
+                            <option value="asc">Sort: Low → High (Asc)</option>
+                          </select>
+                        </div>
+                        <div id="filterTracked2dCustomRow" class="custom-range-inputs" style="display:none;">
+                          <input type="number" id="filterTracked2dMin" class="col-filter-input range-num" step="0.1" placeholder="Min %" title="Minimum percentage" />
+                          <span class="range-sep">to</span>
+                          <input type="number" id="filterTracked2dMax" class="col-filter-input range-num" step="0.1" placeholder="Max %" title="Maximum percentage" />
+                        </div>
+                      </div>
+                    </th>
+                    <th class="filter-empty"><span class="text-muted" style="font-size:11px;">—</span></th>
+                    <th class="filter-action-th">
+                      <button type="button" id="btnClearTrackedFilters" class="btn btn-xs btn-reset-filters" title="Reset all column filters">Reset</button>
+                    </th>
                   </tr>
                 </thead>
                 <tbody id="trackedStocksTbody"></tbody>
@@ -109,7 +210,7 @@
           <!-- 2) Search box for specific stocks in ML_stock Parquet Memory -->
           <div class="panel">
             <div class="panel-header">
-              <div>
+              <div class="panel-header-title-group">
                 <h2 class="panel-title">2. ML_stock Parquet Memory Explorer</h2>
                 <p class="panel-desc">Search all cached tickers in <code>ML_stock/data/raw</code> to inspect in detail or run new predictions.</p>
               </div>
@@ -129,7 +230,7 @@
               </div>
             </div>
             <div class="table-wrap table-scroll-md">
-              <table class="data-table">
+              <table class="data-table" style="min-width: 680px;">
                 <thead>
                   <tr>
                     <th>Ticker</th>
@@ -167,19 +268,24 @@
             <!-- Tab 2: Specific Prediction Calls History -->
             <div id="tabPredictionHistory" class="tab-pane hidden">
               <div class="subfilter-bar">
-                <span class="muted-label">Filter call source:</span>
+                <span class="muted-label">Source:</span>
                 <select id="predHistorySourceSelect" class="input-select">
-                  <option value="all">All Stored Predictions (Manual + Screen)</option>
-                  <option value="manual">Manual Stock Prediction Calls Only</option>
-                  <option value="screen">Screen Hit Predictions Only</option>
+                  <option value="all">All Sources (Manual + Screen)</option>
+                  <option value="manual">Manual Predictions Only</option>
+                  <option value="screen">Screen Hits Only</option>
+                </select>
+                <span class="muted-label" style="margin-left:6px;">Model:</span>
+                <select id="predHistoryModelSelect" class="input-select">
+                  <option value="all">All Models</option>
                 </select>
               </div>
               <div class="table-wrap table-scroll-lg">
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>Timestamp (UTC)</th>
+                      <th>Date</th>
                       <th>Ticker</th>
+                      <th>Model Run</th>
                       <th>Source</th>
                       <th>Anchor Date</th>
                       <th>Anchor Px</th>
@@ -197,7 +303,7 @@
           <!-- Active Screening Call Inspector Panel (when a screening run is clicked) -->
           <div id="screenRunInspectorPanel" class="panel hidden">
             <div class="panel-header">
-              <div>
+              <div class="panel-header-title-group">
                 <h2 class="panel-title" id="screenInspectorTitle">Screening Call Details</h2>
                 <p class="panel-desc" id="screenInspectorMeta"></p>
               </div>
@@ -212,9 +318,9 @@
               <button class="subtab-btn" data-screentab="indexes">Global Indexes</button>
             </div>
             <div class="table-wrap table-scroll-md">
-              <table class="data-table">
+              <table class="data-table" style="min-width: 720px;">
                 <thead>
-                  <tr>
+                  <tr id="screenInspectorTheadRow">
                     <th>Ticker</th>
                     <th>Name</th>
                     <th>Last Px</th>
@@ -233,7 +339,158 @@
       </div>
     </section>
 
-    <!-- ==================== VIEW 2: SELECTED STOCK DETAIL VIEW ==================== -->
+    <!-- ==================== VIEW 2: MODEL RUNS & BENCHMARKS EXPLORER ==================== -->
+    <section id="modelRunsView" class="view-section hidden">
+      <!-- Section Header & Controls -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-header-title-group">
+            <h2 class="panel-title">🔬 ML_stock Model Runs Leaderboard &amp; Benchmark Explorer</h2>
+            <p class="panel-desc">
+              Compare PatchTST and MarketQueryPatchTST architectures, training convergence, multi-horizon test benchmarks, and probability cone calibration across all archived model runs.
+            </p>
+          </div>
+          <div class="panel-controls">
+            <button class="btn btn-sm btn-secondary" id="btnRefreshModelsList">⟳ Refresh Runs</button>
+          </div>
+        </div>
+
+        <!-- Master Runs Leaderboard Table -->
+        <div class="table-wrap table-scroll-panel1">
+          <table class="data-table runs-leaderboard-table" id="modelRunsLeaderboardTable">
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Run ID / Tag</th>
+                <th>Architecture</th>
+                <th>Layers (Enc / Mkt)</th>
+                <th>Heads</th>
+                <th>Best Epoch</th>
+                <th>Test Score</th>
+                <th>Test MAE</th>
+                <th>Directional Hit Rate</th>
+                <th>Test IC</th>
+                <th>80% Coverage</th>
+                <th>Calib MAE</th>
+                <th>Duration</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="modelRunsLeaderboardTbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Selected Model Activation Bar -->
+      <div class="model-activation-bar" id="modelActivationBar">
+        <div class="model-activation-info">
+          <div>
+            <strong>Selected Run:</strong>
+            <span id="activeBarRunId" class="font-mono text-accent" style="margin-left: 6px;">--</span>
+            <span id="activeBarBadge" style="margin-left: 6px;"></span>
+          </div>
+          <div class="text-muted" style="font-size: 11.5px;" id="activeBarPath"></div>
+        </div>
+        <div class="model-activation-actions">
+          <label class="checkbox-inline" title="Also overwrite ML_stock/checkpoints/patchtst_best.pt so external scripts and new terminals default to this model">
+            <input type="checkbox" id="chkPromoteToRoot" /> Sync to Root Checkpoint (patchtst_best.pt)
+          </label>
+          <button class="btn btn-primary" id="btnActivateSelectedModel">⚡ Activate This Model</button>
+        </div>
+      </div>
+
+      <!-- Selected Model Detail Subtabs -->
+      <div class="panel" id="modelDetailPanel">
+        <div class="panel-header">
+          <div class="tabs-bar">
+            <button class="tab-btn active" data-modeltab="subtabBenchmark">1. Per-Horizon Test Benchmark</button>
+            <button class="tab-btn" data-modeltab="subtabCalibration">2. Cone Confidence Calibration</button>
+            <button class="tab-btn" data-modeltab="subtabHistory">3. Epoch Training History</button>
+            <button class="tab-btn" data-modeltab="subtabHyperparams">4. Architecture &amp; Hyperparameters</button>
+            <button class="tab-btn" data-modeltab="subtabReport">5. Terminal Test Report</button>
+          </div>
+          <div class="panel-controls">
+            <span class="text-muted" id="modelInspectionHeaderTag">Inspect Run Details</span>
+          </div>
+        </div>
+
+        <!-- Subtab 1: Per-Horizon Test Benchmark -->
+        <div id="subtabBenchmark" class="tab-pane active" style="padding: 14px;">
+          <div class="table-wrap">
+            <table class="data-table" id="runBenchmarkTable">
+              <thead>
+                <tr>
+                  <th>Forecast Horizon</th>
+                  <th>MAE</th>
+                  <th>RMSE</th>
+                  <th>Pinball Loss</th>
+                  <th>Directional Hit Rate</th>
+                  <th>Information Coeff (IC)</th>
+                  <th>80% Band Coverage</th>
+                  <th>80% Mean Width</th>
+                </tr>
+              </thead>
+              <tbody id="runBenchmarkTbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Subtab 2: Probability Cone Calibration -->
+        <div id="subtabCalibration" class="tab-pane hidden" style="padding: 14px;">
+          <p class="panel-desc" style="margin-bottom: 12px;">
+            Empirical coverage and interval spread across the test partition. A well-calibrated cone shows empirical coverage closely tracking nominal confidence with minimal inversion.
+          </p>
+          <div class="table-wrap">
+            <table class="data-table" id="runCalibrationTable">
+              <thead>
+                <tr>
+                  <th>Confidence Tier</th>
+                  <th>Target Nominal Coverage</th>
+                  <th>Realized Empirical Coverage</th>
+                  <th>Calibration Gap (Bias)</th>
+                  <th>Mean Return Interval Width</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="runCalibrationTbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Subtab 3: Epoch Training History -->
+        <div id="subtabHistory" class="tab-pane hidden" style="padding: 14px;">
+          <div class="table-wrap table-scroll-md">
+            <table class="data-table" id="runHistoryTable">
+              <thead>
+                <tr>
+                  <th>Epoch</th>
+                  <th>Train Loss</th>
+                  <th>Val Loss</th>
+                  <th>Val Score</th>
+                  <th>Val Dir Acc</th>
+                  <th>Val IC</th>
+                  <th>Learning Rate</th>
+                  <th>Epoch Duration</th>
+                </tr>
+              </thead>
+              <tbody id="runHistoryTbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Subtab 4: Hyperparameters & Architecture -->
+        <div id="subtabHyperparams" class="tab-pane hidden" style="padding: 14px;">
+          <div class="model-meta-grid" id="runHyperparamsGrid"></div>
+        </div>
+
+        <!-- Subtab 5: Terminal Report -->
+        <div id="subtabReport" class="tab-pane hidden" style="padding: 14px;">
+          <pre class="report-terminal-pre" id="runReportPre">Loading report...</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== VIEW 3: SELECTED STOCK DETAIL VIEW ==================== -->
     <section id="stockDetailView" class="view-section hidden">
       <!-- Stock Header Bar -->
       <div class="stock-header-bar">
@@ -260,7 +517,34 @@
             <label for="detailAsOfDate" class="form-label-inline" title="Leave blank for latest bar, or pick a past date to test how the model's cone performed against actual subsequent prices">
               Point-in-Time Date:
             </label>
-            <input type="date" id="detailAsOfDate" class="input-sm" title="Optional historical anchor date" />
+            <div class="date-input-wrap">
+              <input
+                type="text"
+                id="detailAsOfDate"
+                class="input-sm font-mono date-picker-text"
+                placeholder="YYYY-MM-DD"
+                maxlength="10"
+                autocomplete="off"
+                title="Point-in-Time Date (YYYY-MM-DD)"
+              />
+              <button type="button" class="btn-calendar-trigger" tabindex="-1" title="Choose date from calendar">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                  <line x1="16" y1="2" x2="16" y2="6"></line>
+                  <line x1="8" y1="2" x2="8" y2="6"></line>
+                  <line x1="3" y1="10" x2="21" y2="10"></line>
+                </svg>
+              </button>
+              <input
+                type="date"
+                id="detailAsOfDateNative"
+                class="date-picker-native-overlay"
+                tabindex="-1"
+                aria-hidden="true"
+              />
+            </div>
+            <label for="detailModelSelect" class="form-label-inline">Model:</label>
+            <select id="detailModelSelect" class="input-select" title="Model checkpoint used for this forecast"></select>
             <label for="detailNumSamples" class="form-label-inline">Samples:</label>
             <select id="detailNumSamples" class="input-select">
               <option value="1">1 (Fast)</option>
@@ -392,6 +676,10 @@
         </p>
         <div class="form-grid">
           <div class="form-group">
+            <label>Model Checkpoint</label>
+            <select id="modalScreenModel" class="input-select full-width" title="Model checkpoint used for screening"></select>
+          </div>
+          <div class="form-group">
             <label>Target Universe</label>
             <select id="modalScreenUniverse" class="input-select full-width">
               <option value="all">All Universes + Local Parquet Memory</option>
@@ -444,12 +732,41 @@
         </p>
         <div class="form-grid">
           <div class="form-group">
+            <label>Model Checkpoint</label>
+            <select id="modalPredictModel" class="input-select full-width" title="Model checkpoint used for forecast"></select>
+          </div>
+          <div class="form-group">
             <label>Ticker Symbol</label>
             <input type="text" id="modalPredictTicker" class="input-sm full-width" placeholder="e.g. NVDA, AAPL, MSFT, ^GSPC" />
           </div>
           <div class="form-group">
             <label>Point-in-Time Anchor Date (Optional — leave blank for latest)</label>
-            <input type="date" id="modalPredictAsOfDate" class="input-sm full-width" />
+            <div class="date-input-wrap full-width">
+              <input
+                type="text"
+                id="modalPredictAsOfDate"
+                class="input-sm font-mono full-width date-picker-text"
+                placeholder="YYYY-MM-DD"
+                maxlength="10"
+                autocomplete="off"
+                title="Point-in-Time Date (YYYY-MM-DD)"
+              />
+              <button type="button" class="btn-calendar-trigger" tabindex="-1" title="Choose date from calendar">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                  <line x1="16" y1="2" x2="16" y2="6"></line>
+                  <line x1="8" y1="2" x2="8" y2="6"></line>
+                  <line x1="3" y1="10" x2="21" y2="10"></line>
+                </svg>
+              </button>
+              <input
+                type="date"
+                id="modalPredictAsOfDateNative"
+                class="date-picker-native-overlay"
+                tabindex="-1"
+                aria-hidden="true"
+              />
+            </div>
           </div>
           <div class="form-group">
             <label>Ensemble Samples</label>

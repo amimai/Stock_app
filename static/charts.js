@@ -33,17 +33,38 @@
 
   function drawBandPolygon(ctx, points, xFn, yLowFn, yHighFn, fillStyle, strokeStyle) {
     if (!points || points.length < 2) return;
-    ctx.save();
-    ctx.beginPath();
+    const highPts = [];
+    const lowPts = [];
+    let hasValidWidth = false;
+
     for (let i = 0; i < points.length; i++) {
       const x = xFn(points[i], i);
-      const y = yHighFn(points[i], i);
+      const yHigh = yHighFn(points[i], i);
+      const yLow = yLowFn(points[i], i);
+
+      if (!Number.isFinite(x) || !Number.isFinite(yHigh) || !Number.isFinite(yLow)) {
+        return; // Guard against NaN / non-finite coordinates; gracefully skip drawing this band
+      }
+
+      if (Math.abs(yHigh - yLow) > 1e-4) {
+        hasValidWidth = true;
+      }
+      highPts.push({ x, y: yHigh });
+      lowPts.push({ x, y: yLow });
+    }
+
+    // Skip collapsed 0-width lines
+    if (!hasValidWidth) return;
+
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < highPts.length; i++) {
+      const { x, y } = highPts[i];
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
-    for (let i = points.length - 1; i >= 0; i--) {
-      const x = xFn(points[i], i);
-      const y = yLowFn(points[i], i);
+    for (let i = lowPts.length - 1; i >= 0; i--) {
+      const { x, y } = lowPts[i];
       ctx.lineTo(x, y);
     }
     ctx.closePath();
@@ -151,8 +172,10 @@
 
     const xForSlot = (slot) =>
       pad.left + ((slot + 0.5) / totalSlots) * plotW;
-    const yForPrice = (p) =>
-      pad.top + (1 - (p - minP) / (maxP - minP)) * priceH;
+    const yForPrice = (p) => {
+      if (p === null || p === undefined || isNaN(p) || !Number.isFinite(Number(p))) return NaN;
+      return pad.top + (1 - (Number(p) - minP) / (maxP - minP)) * priceH;
+    };
 
     // Draw horizontal price gridlines
     ctx.strokeStyle = "rgba(38, 51, 77, 0.45)";
@@ -171,14 +194,15 @@
       ctx.fillText(fmtPrice(pVal), pad.left + plotW + 6, y + 4);
     }
 
-    // Draw X-axis date labels
+    // Draw X-axis date labels (strictly YYYY-MM-DD)
     ctx.textAlign = "center";
-    const labelCount = Math.min(8, totalSlots);
+    const labelCount = Math.min(6, totalSlots);
     const stepSlots = Math.max(1, Math.floor(totalSlots / labelCount));
     for (let s = 0; s < totalSlots; s += stepSlots) {
       const x = xForSlot(s);
       ctx.fillStyle = "#64748b";
-      ctx.fillText(timelineDates[s].slice(5), x, height - 10);
+      const dStr = timelineDates[s] ? String(timelineDates[s]).slice(0, 10) : "";
+      ctx.fillText(dStr, x, height - 10);
     }
 
     // Draw probability cones (background layer before/around candles)
@@ -191,49 +215,60 @@
 
       const xFn = (pt) => xForSlot(dateToIndex.get(pt.date));
       // 90% Tail Band [5%-95%]
-      drawBandPolygon(
-        ctx,
-        dCone,
-        xFn,
-        (pt) => yForPrice(pt.prices.q05),
-        (pt) => yForPrice(pt.prices.q95),
-        isSelected ? "rgba(168, 85, 247, 0.14)" : "rgba(168, 85, 247, 0.06)",
-        null
-      );
+      const has90 = dCone.some((pt) => pt.prices && Number.isFinite(Number(pt.prices.q05)) && Number.isFinite(Number(pt.prices.q95)));
+      if (has90) {
+        drawBandPolygon(
+          ctx,
+          dCone,
+          xFn,
+          (pt) => yForPrice(pt.prices?.q05),
+          (pt) => yForPrice(pt.prices?.q95),
+          isSelected ? "rgba(168, 85, 247, 0.14)" : "rgba(168, 85, 247, 0.06)",
+          null
+        );
+      }
       // 80% Standard Band [10%-90%]
-      drawBandPolygon(
-        ctx,
-        dCone,
-        xFn,
-        (pt) => yForPrice(pt.prices.q10),
-        (pt) => yForPrice(pt.prices.q90),
-        isSelected ? "rgba(56, 189, 248, 0.20)" : "rgba(56, 189, 248, 0.09)",
-        isSelected ? "rgba(56, 189, 248, 0.45)" : null
-      );
+      const has80 = dCone.some((pt) => pt.prices && Number.isFinite(Number(pt.prices.q10)) && Number.isFinite(Number(pt.prices.q90)));
+      if (has80) {
+        drawBandPolygon(
+          ctx,
+          dCone,
+          xFn,
+          (pt) => yForPrice(pt.prices?.q10),
+          (pt) => yForPrice(pt.prices?.q90),
+          isSelected ? "rgba(56, 189, 248, 0.20)" : "rgba(56, 189, 248, 0.09)",
+          isSelected ? "rgba(56, 189, 248, 0.45)" : null
+        );
+      }
       // 50% Core Band [25%-75%]
-      drawBandPolygon(
-        ctx,
-        dCone,
-        xFn,
-        (pt) => yForPrice(pt.prices.q25),
-        (pt) => yForPrice(pt.prices.q75),
-        isSelected ? "rgba(56, 189, 248, 0.36)" : "rgba(56, 189, 248, 0.15)",
-        null
-      );
+      const has50 = dCone.some((pt) => pt.prices && Number.isFinite(Number(pt.prices.q25)) && Number.isFinite(Number(pt.prices.q75)));
+      if (has50) {
+        drawBandPolygon(
+          ctx,
+          dCone,
+          xFn,
+          (pt) => yForPrice(pt.prices?.q25),
+          (pt) => yForPrice(pt.prices?.q75),
+          isSelected ? "rgba(56, 189, 248, 0.36)" : "rgba(56, 189, 248, 0.15)",
+          null
+        );
+      }
 
       // Anchor vertical marker
       const anchorSlot = dateToIndex.get(dCone[0].date);
       if (anchorSlot !== undefined) {
         const ax = xForSlot(anchorSlot);
-        ctx.save();
-        ctx.strokeStyle = isSelected ? "#f59e0b" : "rgba(245, 158, 11, 0.45)";
-        ctx.setLineDash([4, 4]);
-        ctx.lineWidth = isSelected ? 1.5 : 1;
-        ctx.beginPath();
-        ctx.moveTo(ax, pad.top);
-        ctx.lineTo(ax, pad.top + priceH);
-        ctx.stroke();
-        ctx.restore();
+        if (Number.isFinite(ax)) {
+          ctx.save();
+          ctx.strokeStyle = isSelected ? "#f59e0b" : "rgba(245, 158, 11, 0.45)";
+          ctx.setLineDash([4, 4]);
+          ctx.lineWidth = isSelected ? 1.5 : 1;
+          ctx.beginPath();
+          ctx.moveTo(ax, pad.top);
+          ctx.lineTo(ax, pad.top + priceH);
+          ctx.stroke();
+          ctx.restore();
+        }
       }
 
       // Median 50% trajectory line
@@ -241,28 +276,39 @@
       ctx.strokeStyle = isSelected ? "#38bdf8" : "rgba(56, 189, 248, 0.55)";
       ctx.lineWidth = isSelected ? 2.2 : 1.3;
       ctx.beginPath();
-      dCone.forEach((pt, idx) => {
+      let medStarted = false;
+      dCone.forEach((pt) => {
+        if (!pt.prices || !Number.isFinite(Number(pt.prices.q50))) return;
         const x = xFn(pt);
         const y = yForPrice(pt.prices.q50);
-        if (idx === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        if (!medStarted) {
+          ctx.moveTo(x, y);
+          medStarted = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
       });
-      ctx.stroke();
+      if (medStarted) ctx.stroke();
+      ctx.restore();
 
       // Milestone dots on selected cone
       if (isSelected) {
+        ctx.save();
         dCone.forEach((pt) => {
           if (pt.is_milestone || pt.step === 0) {
+            if (!pt.prices || !Number.isFinite(Number(pt.prices.q50))) return;
             const x = xFn(pt);
             const y = yForPrice(pt.prices.q50);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) return;
             ctx.fillStyle = pt.step === 0 ? "#f59e0b" : "#38bdf8";
             ctx.beginPath();
             ctx.arc(x, y, 3.5, 0, Math.PI * 2);
             ctx.fill();
           }
         });
+        ctx.restore();
       }
-      ctx.restore();
     });
 
     // Draw Market Bars (Candlesticks or Line) + Volume
@@ -376,12 +422,16 @@
 
     dailyCone.forEach((pt) => {
       const conv = (qKey) => {
-        if (useReturn) {
-          return (Math.exp(Number(pt.returns[qKey] || 0)) - 1) * 100;
+        const val = useReturn ? pt.returns?.[qKey] : pt.prices?.[qKey];
+        if (val === null || val === undefined || isNaN(val) || !Number.isFinite(Number(val))) {
+          return NaN;
         }
-        return Number(pt.prices[qKey] || anchorClose);
+        if (useReturn) {
+          return (Math.exp(Number(val)) - 1) * 100;
+        }
+        return Number(val);
       };
-      const hasAct = pt.actual_close !== null && pt.actual_close !== undefined;
+      const hasAct = pt.actual_close !== null && pt.actual_close !== undefined && Number.isFinite(Number(pt.actual_close));
       slots.push({
         step: pt.step,
         date: pt.date,
@@ -396,20 +446,20 @@
         q95: conv("q95"),
         actualVal: hasAct
           ? useReturn
-            ? (pt.actual_close / anchorClose - 1) * 100
-            : pt.actual_close
+            ? (Number(pt.actual_close) / anchorClose - 1) * 100
+            : Number(pt.actual_close)
           : null,
         actualHigh:
-          hasAct && pt.actual_high
+          hasAct && pt.actual_high !== null && pt.actual_high !== undefined && Number.isFinite(Number(pt.actual_high))
             ? useReturn
-              ? (pt.actual_high / anchorClose - 1) * 100
-              : pt.actual_high
+              ? (Number(pt.actual_high) / anchorClose - 1) * 100
+              : Number(pt.actual_high)
             : null,
         actualLow:
-          hasAct && pt.actual_low
+          hasAct && pt.actual_low !== null && pt.actual_low !== undefined && Number.isFinite(Number(pt.actual_low))
             ? useReturn
-              ? (pt.actual_low / anchorClose - 1) * 100
-              : pt.actual_low
+              ? (Number(pt.actual_low) / anchorClose - 1) * 100
+              : Number(pt.actual_low)
             : null,
       });
     });
@@ -417,13 +467,17 @@
     let minY = Infinity;
     let maxY = -Infinity;
     slots.forEach((s) => {
-      if (s.actualVal !== null && s.actualVal !== undefined) {
-        minY = Math.min(minY, s.actualLow !== null ? s.actualLow : s.actualVal);
-        maxY = Math.max(maxY, s.actualHigh !== null ? s.actualHigh : s.actualVal);
+      if (s.actualVal !== null && s.actualVal !== undefined && Number.isFinite(s.actualVal)) {
+        minY = Math.min(minY, s.actualLow !== null && Number.isFinite(s.actualLow) ? s.actualLow : s.actualVal);
+        maxY = Math.max(maxY, s.actualHigh !== null && Number.isFinite(s.actualHigh) ? s.actualHigh : s.actualVal);
       }
       if (s.isCone) {
-        minY = Math.min(minY, s.q05, s.q10);
-        maxY = Math.max(maxY, s.q95, s.q90);
+        [s.q05, s.q10, s.q25, s.q50, s.q75, s.q90, s.q95].forEach((qv) => {
+          if (qv !== null && qv !== undefined && Number.isFinite(qv)) {
+            minY = Math.min(minY, qv);
+            maxY = Math.max(maxY, qv);
+          }
+        });
       }
     });
 
@@ -441,7 +495,10 @@
     const totalSlots = Math.max(1, slots.length);
 
     const xAt = (idx) => pad.left + ((idx + 0.5) / totalSlots) * plotW;
-    const yAt = (val) => pad.top + (1 - (val - minY) / (maxY - minY)) * plotH;
+    const yAt = (val) => {
+      if (val === null || val === undefined || isNaN(val) || !Number.isFinite(Number(val))) return NaN;
+      return pad.top + (1 - (Number(val) - minY) / (maxY - minY)) * plotH;
+    };
 
     // Gridlines
     ctx.strokeStyle = "rgba(38, 51, 77, 0.45)";
@@ -467,51 +524,62 @@
     });
 
     // Draw 90% Tail Band [5%-95%], 80% Std Band [10%-90%], 50% Core Band [25%-75%]
-    drawBandPolygon(
-      ctx,
-      coneIdxs,
-      (item) => xAt(item.i),
-      (item) => yAt(item.s.q05),
-      (item) => yAt(item.s.q95),
-      "rgba(168, 85, 247, 0.16)",
-      "rgba(168, 85, 247, 0.35)"
-    );
-    drawBandPolygon(
-      ctx,
-      coneIdxs,
-      (item) => xAt(item.i),
-      (item) => yAt(item.s.q10),
-      (item) => yAt(item.s.q90),
-      "rgba(56, 189, 248, 0.22)",
-      "rgba(56, 189, 248, 0.50)"
-    );
-    drawBandPolygon(
-      ctx,
-      coneIdxs,
-      (item) => xAt(item.i),
-      (item) => yAt(item.s.q25),
-      (item) => yAt(item.s.q75),
-      "rgba(56, 189, 248, 0.38)",
-      "rgba(56, 189, 248, 0.65)"
-    );
+    const has90 = coneIdxs.some((item) => Number.isFinite(item.s.q05) && Number.isFinite(item.s.q95));
+    if (has90) {
+      drawBandPolygon(
+        ctx,
+        coneIdxs,
+        (item) => xAt(item.i),
+        (item) => yAt(item.s.q05),
+        (item) => yAt(item.s.q95),
+        "rgba(168, 85, 247, 0.16)",
+        "rgba(168, 85, 247, 0.35)"
+      );
+    }
+    const has80 = coneIdxs.some((item) => Number.isFinite(item.s.q10) && Number.isFinite(item.s.q90));
+    if (has80) {
+      drawBandPolygon(
+        ctx,
+        coneIdxs,
+        (item) => xAt(item.i),
+        (item) => yAt(item.s.q10),
+        (item) => yAt(item.s.q90),
+        "rgba(56, 189, 248, 0.22)",
+        "rgba(56, 189, 248, 0.50)"
+      );
+    }
+    const has50 = coneIdxs.some((item) => Number.isFinite(item.s.q25) && Number.isFinite(item.s.q75));
+    if (has50) {
+      drawBandPolygon(
+        ctx,
+        coneIdxs,
+        (item) => xAt(item.i),
+        (item) => yAt(item.s.q25),
+        (item) => yAt(item.s.q75),
+        "rgba(56, 189, 248, 0.38)",
+        "rgba(56, 189, 248, 0.65)"
+      );
+    }
 
     // Anchor vertical marker (step == 0)
     const anchorIdx = slots.findIndex((s) => s.step === 0);
     if (anchorIdx !== -1) {
       const ax = xAt(anchorIdx);
-      ctx.save();
-      ctx.strokeStyle = "#f59e0b";
-      ctx.setLineDash([5, 4]);
-      ctx.lineWidth = 1.6;
-      ctx.beginPath();
-      ctx.moveTo(ax, pad.top);
-      ctx.lineTo(ax, pad.top + plotH);
-      ctx.stroke();
-      ctx.fillStyle = "#f59e0b";
-      ctx.font = "bold 11px sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText("Prediction Anchor (" + slots[anchorIdx].date + ")", ax, pad.top - 7);
-      ctx.restore();
+      if (Number.isFinite(ax)) {
+        ctx.save();
+        ctx.strokeStyle = "#f59e0b";
+        ctx.setLineDash([5, 4]);
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(ax, pad.top);
+        ctx.lineTo(ax, pad.top + plotH);
+        ctx.stroke();
+        ctx.fillStyle = "#f59e0b";
+        ctx.font = "bold 11px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("Prediction Anchor (" + slots[anchorIdx].date + ")", ax, pad.top - 7);
+        ctx.restore();
+      }
     }
 
     // Draw Median Forecast (50%) trajectory
@@ -520,13 +588,20 @@
     ctx.lineWidth = 2.4;
     ctx.setLineDash([6, 3]);
     ctx.beginPath();
-    coneIdxs.forEach((item, k) => {
+    let q50Started = false;
+    coneIdxs.forEach((item) => {
+      if (!Number.isFinite(item.s.q50)) return;
       const x = xAt(item.i);
       const y = yAt(item.s.q50);
-      if (k === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      if (!q50Started) {
+        ctx.moveTo(x, y);
+        q50Started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
     });
-    ctx.stroke();
+    if (q50Started) ctx.stroke();
     ctx.restore();
 
     // Draw Actual Price trajectory (prior to prediction + realized after prediction)
@@ -536,9 +611,10 @@
     ctx.beginPath();
     let started = false;
     slots.forEach((s, idx) => {
-      if (s.actualVal === null || s.actualVal === undefined) return;
+      if (s.actualVal === null || s.actualVal === undefined || !Number.isFinite(Number(s.actualVal))) return;
       const x = xAt(idx);
       const y = yAt(s.actualVal);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
       if (!started) {
         ctx.moveTo(x, y);
         started = true;
@@ -546,31 +622,43 @@
         ctx.lineTo(x, y);
       }
     });
-    ctx.stroke();
+    if (started) ctx.stroke();
 
     // Draw High-Low whiskers & dots on realized post-prediction bars
     slots.forEach((s, idx) => {
       const x = xAt(idx);
       if (s.isCone && s.isMilestone) {
         // Milestone marker on Median forecast
-        ctx.fillStyle = "#38bdf8";
-        ctx.beginPath();
-        ctx.arc(x, yAt(s.q50), 4, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      if (s.actualVal !== null && s.actualVal !== undefined && s.step >= 0) {
-        if (s.actualHigh !== null && s.actualLow !== null) {
-          ctx.strokeStyle = "rgba(16, 185, 129, 0.45)";
-          ctx.lineWidth = 1.2;
-          ctx.beginPath();
-          ctx.moveTo(x, yAt(s.actualHigh));
-          ctx.lineTo(x, yAt(s.actualLow));
-          ctx.stroke();
+        if (Number.isFinite(s.q50)) {
+          const y = yAt(s.q50);
+          if (Number.isFinite(x) && Number.isFinite(y)) {
+            ctx.fillStyle = "#38bdf8";
+            ctx.beginPath();
+            ctx.arc(x, y, 4, 0, Math.PI * 2);
+            ctx.fill();
+          }
         }
-        ctx.fillStyle = s.step === 0 ? "#f59e0b" : "#10b981";
-        ctx.beginPath();
-        ctx.arc(x, yAt(s.actualVal), s.isMilestone ? 4.2 : 2.8, 0, Math.PI * 2);
-        ctx.fill();
+      }
+      if (s.actualVal !== null && s.actualVal !== undefined && Number.isFinite(Number(s.actualVal)) && s.step >= 0) {
+        if (s.actualHigh !== null && s.actualLow !== null && Number.isFinite(Number(s.actualHigh)) && Number.isFinite(Number(s.actualLow))) {
+          const yHigh = yAt(s.actualHigh);
+          const yLow = yAt(s.actualLow);
+          if (Number.isFinite(x) && Number.isFinite(yHigh) && Number.isFinite(yLow)) {
+            ctx.strokeStyle = "rgba(16, 185, 129, 0.45)";
+            ctx.lineWidth = 1.2;
+            ctx.beginPath();
+            ctx.moveTo(x, yHigh);
+            ctx.lineTo(x, yLow);
+            ctx.stroke();
+          }
+        }
+        const yAct = yAt(s.actualVal);
+        if (Number.isFinite(x) && Number.isFinite(yAct)) {
+          ctx.fillStyle = s.step === 0 ? "#f59e0b" : "#10b981";
+          ctx.beginPath();
+          ctx.arc(x, yAct, s.isMilestone ? 4.2 : 2.8, 0, Math.PI * 2);
+          ctx.fill();
+        }
       }
     });
     ctx.restore();

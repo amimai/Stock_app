@@ -8,10 +8,13 @@ MarketQueryPatchTST and MarketScreener classes.
 
 from __future__ import annotations
 
+import csv
 from datetime import datetime, timezone
+import json
 import logging
 import math
 from pathlib import Path
+import shutil
 import sys
 import threading
 import time
@@ -21,9 +24,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from cone_utils import build_cone_and_summary, enrich_prediction_with_realized
+from cone_utils import (
+    build_cone_and_summary,
+    enrich_prediction_with_realized,
+    to_yyyy_mm_dd,
+)
 from config import (
     ML_STOCK_CHECKPOINT,
+    ML_STOCK_CHECKPOINTS_DIR,
     ML_STOCK_CONFIG_DIR,
     ML_STOCK_DATA_DIR,
     ML_STOCK_DIR,
@@ -63,7 +71,7 @@ class MLStockBridge:
         self.db = db
         self.data_dir = ML_STOCK_DATA_DIR
         self.config_dir = ML_STOCK_CONFIG_DIR
-        self.checkpoint_path = ML_STOCK_CHECKPOINT
+        self.checkpoints_dir = ML_STOCK_CHECKPOINTS_DIR
         self.device_name = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(self.device_name)
 
@@ -75,29 +83,396 @@ class MLStockBridge:
         )
 
         self._lock = threading.RLock()
-        self._screener: Optional[MarketScreener] = None
-        self._ckpt_mtime: Optional[float] = None
+        self._inference_lock = threading.Lock()
+        self._screeners: Dict[str, Tuple[MarketScreener, float]] = {}
         self._market_pool_cache: Optional[List[Tuple[str, np.ndarray]]] = None
 
-    def _ensure_screener(self) -> MarketScreener:
-        """Lazily loads or reloads MarketScreener when checkpoint changes."""
+        # Resolve active model run from database settings or default to root
+        saved_active = self.db.get_setting("active_run_id", "default")
+        self.active_run_id = saved_active or "default"
+        self.checkpoint_path = self._resolve_checkpoint_path(self.active_run_id)
+
+    def _resolve_checkpoint_path(self, run_id: Optional[str] = None) -> Path:
+        """Resolves the checkpoint file Path for a given run_id or default."""
+        clean_id = (run_id or "").strip()
+        if not clean_id or clean_id in ("default", "root", "active"):
+            return ML_STOCK_CHECKPOINT.resolve()
+
+        # Reject path traversal attempts (e.g. '..' or absolute paths outside checkpoints_dir)
+        if ".." in clean_id or clean_id.startswith("/") or clean_id.startswith("\\"):
+            raise ValueError(f"Path traversal detected in model run_id: '{run_id}'")
+
+        checkpoints_dir_resolved = self.checkpoints_dir.resolve()
+        cand = (self.checkpoints_dir / clean_id / "patchtst_best.pt").resolve()
+
+        # Verify that candidate is strictly within checkpoints_dir
+        try:
+            cand.relative_to(checkpoints_dir_resolved)
+        except ValueError:
+            raise ValueError(f"Path traversal detected in model run_id: '{run_id}'")
+
+        if cand.exists() and cand.is_file():
+            return cand
+
+        raise FileNotFoundError(f"Model checkpoint '{run_id}' not found")
+
+    def _get_screener_for_path(self, ckpt_path: Path) -> MarketScreener:
+        """Lazily loads or retrieves cached MarketScreener for a specific checkpoint file."""
         with self._lock:
-            if not self.checkpoint_path.exists():
-                raise FileNotFoundError(
-                    f"ML_stock checkpoint not found at {self.checkpoint_path}"
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"Model checkpoint not found at {ckpt_path}")
+            mtime = ckpt_path.stat().st_mtime
+            key = str(ckpt_path.resolve())
+            if key in self._screeners:
+                scr, cached_mtime = self._screeners[key]
+                if cached_mtime == mtime:
+                    return scr
+
+            logger.info(f"Loading ML_stock model from {ckpt_path}...")
+            screener = MarketScreener(
+                checkpoint_path=ckpt_path,
+                data_dir=self.data_dir,
+                config_dir=self.config_dir,
+                device_name=self.device_name,
+            )
+            self._screeners[key] = (screener, mtime)
+            return screener
+
+    def _ensure_screener(self) -> MarketScreener:
+        """Lazily loads or reloads MarketScreener for the current active checkpoint."""
+        return self._get_screener_for_path(self.checkpoint_path)
+
+    def _resolve_screener_and_run_id(
+        self, model_run: Optional[str] = None
+    ) -> Tuple[MarketScreener, Path, str]:
+        """Resolves screener, checkpoint path, and run_id given an optional model_run override."""
+        target_run_id = (model_run or "").strip()
+        if not target_run_id or target_run_id in ("active", ""):
+            target_run_id = self.active_run_id
+            target_path = self.checkpoint_path
+        elif target_run_id in ("default", "root"):
+            target_run_id = "default"
+            target_path = ML_STOCK_CHECKPOINT.resolve()
+        else:
+            target_path = self._resolve_checkpoint_path(target_run_id)
+
+        if not target_path.exists():
+            raise FileNotFoundError(f"Model checkpoint '{target_run_id}' not found at {target_path}")
+
+        screener = self._get_screener_for_path(target_path)
+        return screener, target_path, target_run_id
+
+    def list_available_models(self) -> List[Dict[str, Any]]:
+        """Lists all available model runs from runs_index.csv and checkpoints directory."""
+        models: List[Dict[str, Any]] = []
+        runs_index_file = self.checkpoints_dir / "runs_index.csv"
+        seen_ids = set()
+
+        if runs_index_file.exists():
+            try:
+                with open(runs_index_file, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for r in reader:
+                        r_id = r.get("run_id", "").strip()
+                        if not r_id or r_id in seen_ids:
+                            continue
+                        seen_ids.add(r_id)
+                        ckpt_p = Path(
+                            r.get(
+                                "checkpoint_path",
+                                str(self.checkpoints_dir / r_id / "patchtst_best.pt"),
+                            )
+                        )
+
+                        # Human-friendly badge
+                        model_type = r.get("model_type", "market_query")
+                        short_l = int(r.get("short_layers", 1) or 1)
+                        num_l = int(r.get("num_layers", 4) or 4)
+                        if "3head" in r_id or "3head" in r.get("run_tag", ""):
+                            badge = f"3-Head {num_l}L"
+                        elif "1head" in r_id or "1head" in r.get("run_tag", ""):
+                            badge = f"1-Head {num_l}L"
+                        else:
+                            badge = f"{num_l}L"
+
+                        is_act = (r_id == self.active_run_id)
+
+                        def _parse_float(k: str) -> Optional[float]:
+                            v = r.get(k)
+                            if v is not None and v != "":
+                                try:
+                                    return round(float(v), 5)
+                                except Exception:
+                                    return None
+                            return None
+
+                        models.append(
+                            {
+                                "run_id": r_id,
+                                "run_tag": r.get("run_tag", r_id),
+                                "model_type": model_type,
+                                "num_layers": num_l,
+                                "market_layers": int(r.get("market_layers", 4) or 4),
+                                "short_layers": short_l,
+                                "long_layers": int(r.get("long_layers", 1) or 1),
+                                "vol_layers": int(r.get("vol_layers", 1) or 1),
+                                "best_epoch": int(r.get("best_epoch", 1) or 1),
+                                "epochs_ran": int(r.get("epochs_ran", 1) or 1),
+                                "val_loss": _parse_float("val_loss"),
+                                "val_score": _parse_float("val_score"),
+                                "val_dir_acc": _parse_float("val_dir_acc"),
+                                "val_ic": _parse_float("val_ic"),
+                                "test_loss": _parse_float("test_loss"),
+                                "test_score": _parse_float("test_score"),
+                                "test_mae": _parse_float("test_mae"),
+                                "test_dir_acc": _parse_float("test_dir_acc"),
+                                "test_ic": _parse_float("test_ic"),
+                                "test_cov80": _parse_float("test_cov80"),
+                                "test_calib_mae": _parse_float("test_calib_mae"),
+                                "duration_sec": _parse_float("duration_sec"),
+                                "checkpoint_path": str(ckpt_p),
+                                "badge_label": badge,
+                                "display_name": f"{badge} • {r_id}",
+                                "is_active": is_act,
+                                "exists": ckpt_p.exists(),
+                            }
+                        )
+            except Exception as exc:
+                logger.error(f"Failed parsing runs_index.csv: {exc}")
+
+        # Also discover any subfolders not in runs_index
+        if self.checkpoints_dir.exists():
+            for sub in sorted(self.checkpoints_dir.iterdir(), reverse=True):
+                if sub.is_dir() and sub.name not in seen_ids:
+                    pt = sub / "patchtst_best.pt"
+                    if pt.exists():
+                        seen_ids.add(sub.name)
+                        models.append(
+                            {
+                                "run_id": sub.name,
+                                "run_tag": sub.name,
+                                "model_type": "market_query",
+                                "badge_label": "Archived",
+                                "display_name": sub.name,
+                                "checkpoint_path": str(pt),
+                                "is_active": (sub.name == self.active_run_id),
+                                "exists": True,
+                            }
+                        )
+
+        # Include default root option
+        if ML_STOCK_CHECKPOINT.exists():
+            models.insert(
+                0,
+                {
+                    "run_id": "default",
+                    "run_tag": "active_default",
+                    "model_type": "active",
+                    "badge_label": "Active Root",
+                    "display_name": "Default Root Checkpoint (patchtst_best.pt)",
+                    "checkpoint_path": str(ML_STOCK_CHECKPOINT),
+                    "is_active": (self.active_run_id == "default"),
+                    "exists": True,
+                },
+            )
+
+        return models
+
+    def get_model_detail(self, run_id: str) -> Dict[str, Any]:
+        """Returns full summary, training history rows, and ASCII report for a model run."""
+        clean_id = (run_id or "").strip()
+        if not clean_id:
+            clean_id = self.active_run_id
+
+        if clean_id in ("default", "root"):
+            folder = self.checkpoints_dir
+            ckpt_path = ML_STOCK_CHECKPOINT
+        else:
+            # Reject path traversal
+            if ".." in clean_id or clean_id.startswith("/") or clean_id.startswith("\\"):
+                return {"ok": False, "exists": False, "error": f"Model run '{run_id}' not found"}
+
+            checkpoints_dir_resolved = self.checkpoints_dir.resolve()
+            folder = (self.checkpoints_dir / clean_id).resolve()
+            try:
+                folder.relative_to(checkpoints_dir_resolved)
+            except ValueError:
+                return {"ok": False, "exists": False, "error": f"Model run '{run_id}' not found"}
+
+            if not folder.exists() or not folder.is_dir():
+                return {"ok": False, "exists": False, "error": f"Model run '{run_id}' not found"}
+
+            try:
+                ckpt_path = self._resolve_checkpoint_path(clean_id)
+            except (FileNotFoundError, ValueError):
+                ckpt_path = folder / "patchtst_best.pt"
+
+        summary_data: Dict[str, Any] = {}
+        report_txt = ""
+        history_rows: List[Dict[str, Any]] = []
+
+        summary_path = folder / "run_summary.json"
+        if summary_path.exists():
+            try:
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    summary_data = json.load(f)
+            except Exception as exc:
+                logger.warning(f"Failed loading run_summary.json: {exc}")
+
+        report_path = folder / "report.txt"
+        if report_path.exists():
+            try:
+                report_txt = report_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        hist_path = folder / "history.csv"
+        if hist_path.exists():
+            try:
+                with open(hist_path, "r", encoding="utf-8") as f:
+                    history_rows = list(csv.DictReader(f))
+            except Exception:
+                pass
+
+        has_checkpoint = ckpt_path.exists()
+        if has_checkpoint and not summary_data:
+            try:
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                hp = ckpt.get("hyperparameters", {})
+                summary_data = {
+                    "run_id": clean_id,
+                    "architecture": hp,
+                    "best_val_loss": ckpt.get("best_val_loss"),
+                    "test_metrics": ckpt.get("test_metrics"),
+                }
+            except Exception:
+                pass
+
+        # Normalize metrics in summary_data so both test_evaluation and test_metrics exist with aliases
+        test_eval = summary_data.get("test_evaluation") or summary_data.get("test_metrics") or {}
+        merged_eval: Dict[str, Any] = {}
+        if isinstance(test_eval, dict):
+            merged_eval.update(test_eval)
+        if isinstance(summary_data.get("test_metrics"), dict):
+            merged_eval.update(summary_data["test_metrics"])
+        if isinstance(summary_data.get("test_evaluation"), dict):
+            merged_eval.update(summary_data["test_evaluation"])
+
+        alias_map = [
+            ("loss", "test_loss"),
+            ("score", "test_score"),
+            ("mae", "test_mae"),
+            ("directional_accuracy", "test_dir_acc"),
+            ("dir_acc", "test_dir_acc"),
+            ("information_coefficient", "test_ic"),
+            ("ic", "test_ic"),
+            ("coverage_50pct_band", "test_cov50"),
+            ("coverage_80pct_band", "test_cov80"),
+            ("coverage_90pct_band", "test_cov90"),
+            ("calibration_mae", "test_calib_mae"),
+        ]
+        for long_k, short_k in alias_map:
+            if short_k in summary_data and short_k not in merged_eval:
+                merged_eval[short_k] = summary_data[short_k]
+            if long_k in summary_data and long_k not in merged_eval:
+                merged_eval[long_k] = summary_data[long_k]
+            if long_k in merged_eval and short_k not in merged_eval:
+                merged_eval[short_k] = merged_eval[long_k]
+            elif short_k in merged_eval and long_k not in merged_eval:
+                merged_eval[long_k] = merged_eval[short_k]
+
+        if merged_eval:
+            summary_data["test_evaluation"] = merged_eval
+            summary_data["test_metrics"] = merged_eval
+
+        return {
+            "ok": True,
+            "run_id": clean_id,
+            "checkpoint_path": str(ckpt_path),
+            "exists": has_checkpoint,
+            "is_active": (clean_id == self.active_run_id),
+            "summary": summary_data,
+            "report_txt": report_txt,
+            "history_rows": history_rows,
+        }
+
+    def set_active_model(
+        self, run_id: str, promote_to_root: bool = False
+    ) -> Dict[str, Any]:
+        """Switches the active model used for subsequent predictions and screening calls."""
+        with self._lock:
+            clean_id = (run_id or "").strip()
+            if not clean_id:
+                raise ValueError("Model run_id cannot be empty")
+
+            if clean_id in ("default", "root"):
+                self.active_run_id = "default"
+                self.checkpoint_path = ML_STOCK_CHECKPOINT
+            else:
+                # Reject path traversal
+                if ".." in clean_id or clean_id.startswith("/") or clean_id.startswith("\\"):
+                    raise ValueError(f"Path traversal detected in model run_id: '{run_id}'")
+
+                checkpoints_dir_resolved = self.checkpoints_dir.resolve()
+                target_path = (self.checkpoints_dir / clean_id / "patchtst_best.pt").resolve()
+                try:
+                    target_path.relative_to(checkpoints_dir_resolved)
+                except ValueError:
+                    raise ValueError(f"Path traversal detected in model run_id: '{run_id}'")
+
+                if not target_path.exists():
+                    raise FileNotFoundError(
+                        f"Checkpoint for run '{clean_id}' not found at {target_path}"
+                    )
+                self.active_run_id = clean_id
+                self.checkpoint_path = target_path
+
+            self.db.set_setting("active_run_id", self.active_run_id)
+
+            # Invalidate market pool cache on model switch
+            if self._market_pool_cache is not None:
+                self._market_pool_cache.clear()
+            self._market_pool_cache = None
+
+            # Reload / cache screener for active path
+            screener = self._ensure_screener()
+
+            if promote_to_root and clean_id not in ("default", "root"):
+                # Validate source is strictly within checkpoints_dir
+                src_path = self.checkpoint_path.resolve()
+                try:
+                    src_path.relative_to(self.checkpoints_dir.resolve())
+                except ValueError:
+                    raise ValueError(f"Cannot promote checkpoint outside checkpoints dir: {src_path}")
+
+                logger.info(
+                    f"Promoting checkpoint {self.checkpoint_path} to {ML_STOCK_CHECKPOINT}..."
                 )
-            mtime = self.checkpoint_path.stat().st_mtime
-            if self._screener is None or self._ckpt_mtime != mtime:
-                logger.info(f"Loading ML_stock model from {self.checkpoint_path}...")
-                self._screener = MarketScreener(
-                    checkpoint_path=self.checkpoint_path,
-                    data_dir=self.data_dir,
-                    config_dir=self.config_dir,
-                    device_name=self.device_name,
-                )
-                self._ckpt_mtime = mtime
-                self._market_pool_cache = None
-            return self._screener
+                # Make backup (.pt.bak) before copying
+                if ML_STOCK_CHECKPOINT.exists():
+                    backup_path = ML_STOCK_CHECKPOINT.with_suffix(".pt.bak")
+                    shutil.copy2(ML_STOCK_CHECKPOINT, backup_path)
+
+                shutil.copy2(self.checkpoint_path, ML_STOCK_CHECKPOINT)
+                src_hist = self.checkpoints_dir / clean_id / "history.csv"
+                dst_hist = self.checkpoints_dir / "history.csv"
+                if src_hist.exists():
+                    if dst_hist.exists():
+                        shutil.copy2(dst_hist, dst_hist.with_suffix(".csv.bak"))
+                    shutil.copy2(src_hist, dst_hist)
+
+                # Invalidate screeners cache for root checkpoint path
+                root_resolved = str(ML_STOCK_CHECKPOINT.resolve())
+                self._screeners.pop(root_resolved, None)
+                self._screeners.pop(str(ML_STOCK_CHECKPOINT), None)
+
+            return {
+                "ok": True,
+                "active_run_id": self.active_run_id,
+                "checkpoint_path": str(self.checkpoint_path),
+                "model_type": screener.hp.get("model_type", "patchtst"),
+                "promoted_to_root": promote_to_root,
+            }
 
     def get_system_status(self) -> Dict[str, Any]:
         """Returns ML_stock connection status, model info, and Parquet cache stats."""
@@ -118,6 +493,7 @@ class MLStockBridge:
                         "quantiles": hp.get("quantiles", [0.1, 0.5, 0.9]),
                         "d_model": hp.get("d_model"),
                         "device": self.device_name,
+                        "active_run_id": self.active_run_id,
                     }
                 )
             except Exception as exc:
@@ -126,7 +502,9 @@ class MLStockBridge:
         return {
             "ml_stock_dir": str(ML_STOCK_DIR),
             "data_dir": str(self.data_dir),
+            "checkpoints_dir": str(self.checkpoints_dir),
             "checkpoint_path": str(self.checkpoint_path),
+            "active_run_id": self.active_run_id,
             "parquet_ticker_count": len(stored),
             "universes": universes,
             "model": model_info,
@@ -236,6 +614,7 @@ class MLStockBridge:
         ticker: str,
         bars_limit: int = 320,
         auto_fetch: bool = False,
+        model_run: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Loads stock OHLCV chart data via data_loader.py and enriches all stored predictions."""
         sym = ticker.upper().strip()
@@ -275,7 +654,7 @@ class MLStockBridge:
 
                 bars.append(
                     {
-                        "date": str(ts)[:10],
+                        "date": to_yyyy_mm_dd(ts),
                         "open": round(float(o_val), 4),
                         "high": round(float(h_val), 4),
                         "low": round(float(l_val), 4),
@@ -284,7 +663,7 @@ class MLStockBridge:
                     }
                 )
 
-        raw_preds = self.db.get_stock_predictions(sym, limit=200)
+        raw_preds = self.db.get_stock_predictions(sym, limit=200, model_run=model_run)
         enriched_preds = [
             enrich_prediction_with_realized(p, df) for p in raw_preds
         ]
@@ -365,10 +744,11 @@ class MLStockBridge:
         mc_dropout: bool = False,
         market_resampling: bool = True,
         refresh_data: bool = False,
+        model_run: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Runs a PatchTST forecast on a stock, saves to Stock_app DB, and returns enriched result."""
         sym = ticker.upper().strip()
-        screener = self._ensure_screener()
+        screener, used_path, used_run_id = self._resolve_screener_and_run_id(model_run)
         model = screener.model
         hp = screener.hp
         lookback = screener.lookback
@@ -403,7 +783,7 @@ class MLStockBridge:
         x_np = window_df[screener.feature_cols].values.astype(np.float32)
         x = torch.from_numpy(x_np).unsqueeze(0).to(self.device)
 
-        anchor_date = str(window_df.index[-1])[:10]
+        anchor_date = to_yyyy_mm_dd(window_df.index[-1])
         anchor_close = float(window_df["raw_close"].iloc[-1])
 
         is_market_query = isinstance(model, MarketQueryPatchTST)
@@ -424,70 +804,71 @@ class MLStockBridge:
             )
 
         num_samples = max(1, int(num_samples))
-        if mc_dropout:
-            enable_mc_dropout(model)
-        else:
-            model.eval()
-
         rng = np.random.default_rng(42)
         sample_runs: List[np.ndarray] = []
 
-        try:
-            with torch.no_grad():
-                for _ in range(num_samples):
-                    if is_market_query and len(market_pool) >= 4:
-                        n_take = min(market_context_size - 1, len(market_pool))
-                        if num_samples > 1 and market_resampling and len(market_pool) > n_take:
-                            idx_sel = rng.choice(len(market_pool), size=n_take, replace=False)
-                            sub_pool = [market_pool[i] for i in idx_sel]
-                        else:
-                            sub_pool = market_pool[:n_take]
+        with self._inference_lock:
+            if mc_dropout:
+                enable_mc_dropout(model)
+            else:
+                model.eval()
 
-                        full_tuples = [(sym, x_np)] + sub_pool
-                        actual_n = len(full_tuples)
-                        pad_count = max(0, market_context_size - actual_n)
+            try:
+                with torch.no_grad():
+                    for _ in range(num_samples):
+                        if is_market_query and len(market_pool) >= 4:
+                            n_take = min(market_context_size - 1, len(market_pool))
+                            if num_samples > 1 and market_resampling and len(market_pool) > n_take:
+                                idx_sel = rng.choice(len(market_pool), size=n_take, replace=False)
+                                sub_pool = [market_pool[i] for i in idx_sel]
+                            else:
+                                sub_pool = market_pool[:n_take]
 
-                        m_arrs = [item[1] for item in full_tuples]
-                        for _ in range(pad_count):
-                            m_arrs.append(np.zeros_like(x_np))
+                            full_tuples = [(sym, x_np)] + sub_pool
+                            actual_n = len(full_tuples)
+                            pad_count = max(0, market_context_size - actual_n)
 
-                        m_stack = np.stack(m_arrs, axis=0)
-                        x_m = torch.from_numpy(m_stack).unsqueeze(0).to(self.device)
-
-                        mask_t = None
-                        if pad_count > 0:
-                            mask_np = np.zeros(market_context_size, dtype=bool)
-                            mask_np[actual_n:] = True
-                            mask_t = torch.from_numpy(mask_np).unsqueeze(0).to(self.device)
-
-                        meta_m_t = None
-                        meta_q_t = None
-                        if use_meta:
-                            m_meta = [meta_registry.get_metadata_indices(item[0]) for item in full_tuples]
+                            m_arrs = [item[1] for item in full_tuples]
                             for _ in range(pad_count):
-                                m_meta.append((0, 0, 0, 0))
-                            meta_m_t = torch.tensor([m_meta], dtype=torch.long, device=self.device)
-                            meta_q_t = torch.tensor(
-                                [[meta_registry.get_metadata_indices(sym)]],
-                                dtype=torch.long,
-                                device=self.device,
+                                m_arrs.append(np.zeros_like(x_np))
+
+                            m_stack = np.stack(m_arrs, axis=0)
+                            x_m = torch.from_numpy(m_stack).unsqueeze(0).to(self.device)
+
+                            mask_t = None
+                            if pad_count > 0:
+                                mask_np = np.zeros(market_context_size, dtype=bool)
+                                mask_np[actual_n:] = True
+                                mask_t = torch.from_numpy(mask_np).unsqueeze(0).to(self.device)
+
+                            meta_m_t = None
+                            meta_q_t = None
+                            if use_meta:
+                                m_meta = [meta_registry.get_metadata_indices(item[0]) for item in full_tuples]
+                                for _ in range(pad_count):
+                                    m_meta.append((0, 0, 0, 0))
+                                meta_m_t = torch.tensor([m_meta], dtype=torch.long, device=self.device)
+                                meta_q_t = torch.tensor(
+                                    [[meta_registry.get_metadata_indices(sym)]],
+                                    dtype=torch.long,
+                                    device=self.device,
+                                )
+
+                            h_m = model.encode_market(
+                                x_m, key_padding_mask=mask_t, meta_market=meta_m_t
                             )
+                            preds = model.forward_with_market_state(
+                                x.unsqueeze(1),
+                                h_market=h_m,
+                                key_padding_mask=mask_t,
+                                meta_queries=meta_q_t,
+                            ).squeeze(1)
+                        else:
+                            preds = model(x)
 
-                        h_m = model.encode_market(
-                            x_m, key_padding_mask=mask_t, meta_market=meta_m_t
-                        )
-                        preds = model.forward_with_market_state(
-                            x.unsqueeze(1),
-                            h_market=h_m,
-                            key_padding_mask=mask_t,
-                            meta_queries=meta_q_t,
-                        ).squeeze(1)
-                    else:
-                        preds = model(x)
-
-                    sample_runs.append(preds.squeeze(0).cpu().numpy())
-        finally:
-            model.eval()
+                        sample_runs.append(preds.squeeze(0).cpu().numpy())
+            finally:
+                model.eval()
 
         stacked = np.stack(sample_runs, axis=0)
         pred_returns = np.mean(stacked, axis=0)
@@ -518,7 +899,8 @@ class MLStockBridge:
             anchor_close=anchor_close,
             source="manual",
             model_type="market_query" if is_market_query else "patchtst",
-            checkpoint_path=str(self.checkpoint_path),
+            checkpoint_path=str(used_path),
+            run_id=used_run_id,
             lookback=lookback,
             num_samples=num_samples,
             mc_dropout=mc_dropout,
@@ -541,12 +923,31 @@ class MLStockBridge:
         lookback: int,
     ) -> Dict[str, Any]:
         """Reconstructs full probability cone and summary from a MarketScreener result row."""
-        anchor_date = str(row["last_date"])[:10]
+        anchor_date = to_yyyy_mm_dd(row["last_date"])
         anchor_close = float(row["last_close"])
         is_legacy = milestones == [1, 2] and "ret_1d_50" not in row
 
         q_round = [round(float(q), 2) for q in quantiles]
         pred_mat = np.zeros((len(milestones), len(quantiles)), dtype=np.float64)
+
+        def _interp_quantile(q: float, v10: float, v50: float, v90: float) -> float:
+            min_spread = 0.002
+            if v90 - v10 < min_spread:
+                v10 = min(v10, v50 - min_spread / 2)
+                v90 = max(v90, v50 + min_spread / 2)
+            if v50 < v10:
+                v50 = 0.5 * (v10 + v90)
+            if v50 > v90:
+                v50 = 0.5 * (v10 + v90)
+
+            if q <= 0.10:
+                return v10 - (v50 - v10) * ((0.10 - q) / 0.40)
+            elif q <= 0.50:
+                return v10 + (v50 - v10) * ((q - 0.10) / 0.40)
+            elif q <= 0.90:
+                return v50 + (v90 - v50) * ((q - 0.50) / 0.40)
+            else:
+                return v90 + (v90 - v50) * ((q - 0.90) / 0.40)
 
         if is_legacy:
             r1_50 = float(row.get("day1_ret_50", 0.0))
@@ -554,36 +955,50 @@ class MLStockBridge:
             c2_50 = float(row.get("cum2d_ret_50", 0.0))
             c2_90 = float(row.get("cum2d_ret_90", 0.0))
             half_sp = 0.5 * (c2_90 - c2_10)
+            if half_sp <= 0.001:
+                half_sp = max(0.5 * abs(float(row.get("volatility_spread", 0.0))), 0.005)
+            r1_10 = float(row.get("day1_ret_10", r1_50 - half_sp * 0.6))
+            r1_90 = float(row.get("day1_ret_90", r1_50 + half_sp * 0.6))
             for q_i, q_val in enumerate(q_round):
-                if q_val <= 0.10:
-                    pred_mat[0, q_i] = r1_50 - half_sp * 0.6
-                    pred_mat[1, q_i] = c2_10
-                elif q_val >= 0.90:
-                    pred_mat[0, q_i] = r1_50 + half_sp * 0.6
-                    pred_mat[1, q_i] = c2_90
-                else:
-                    pred_mat[0, q_i] = r1_50
-                    pred_mat[1, q_i] = c2_50
+                pred_mat[0, q_i] = _interp_quantile(q_val, r1_10, r1_50, r1_90)
+                pred_mat[1, q_i] = _interp_quantile(q_val, c2_10, c2_50, c2_90)
         else:
             for h_i, m in enumerate(milestones):
                 r10 = float(row.get(f"ret_{m}d_10", 0.0))
                 r50 = float(row.get(f"ret_{m}d_50", 0.0))
                 r90 = float(row.get(f"ret_{m}d_90", 0.0))
-                r25 = float(row.get(f"ret_{m}d_25", 0.5 * (r10 + r50)))
-                r75 = float(row.get(f"ret_{m}d_75", 0.5 * (r50 + r90)))
-                r05 = float(row.get(f"ret_{m}d_05", r10 - 0.25 * (r50 - r10)))
-                r95 = float(row.get(f"ret_{m}d_95", r90 + 0.25 * (r90 - r50)))
-                q_lookup = {
-                    0.05: r05,
-                    0.10: r10,
-                    0.25: r25,
-                    0.50: r50,
-                    0.75: r75,
-                    0.90: r90,
-                    0.95: r95,
-                }
+                if r10 == 0.0 and r90 == 0.0:
+                    if m == 1 and "day1_ret_50" in row:
+                        r50 = float(row.get("day1_ret_50", 0.0))
+                        r10 = float(row.get("day1_ret_10", r50 - 0.01))
+                        r90 = float(row.get("day1_ret_90", r50 + 0.01))
+                    elif m == 2 and "cum2d_ret_50" in row:
+                        r50 = float(row.get("cum2d_ret_50", 0.0))
+                        r10 = float(row.get("cum2d_ret_10", r50 - 0.01))
+                        r90 = float(row.get("cum2d_ret_90", r50 + 0.01))
+
+                r25 = row.get(f"ret_{m}d_25")
+                r75 = row.get(f"ret_{m}d_75")
+                r05 = row.get(f"ret_{m}d_05")
+                r95 = row.get(f"ret_{m}d_95")
+
                 for q_i, q_val in enumerate(q_round):
-                    pred_mat[h_i, q_i] = q_lookup.get(q_val, r50)
+                    if q_val == 0.10:
+                        pred_mat[h_i, q_i] = r10
+                    elif q_val == 0.50:
+                        pred_mat[h_i, q_i] = r50
+                    elif q_val == 0.90:
+                        pred_mat[h_i, q_i] = r90
+                    elif q_val == 0.25 and r25 is not None:
+                        pred_mat[h_i, q_i] = float(r25)
+                    elif q_val == 0.75 and r75 is not None:
+                        pred_mat[h_i, q_i] = float(r75)
+                    elif q_val == 0.05 and r05 is not None:
+                        pred_mat[h_i, q_i] = float(r05)
+                    elif q_val == 0.95 and r95 is not None:
+                        pred_mat[h_i, q_i] = float(r95)
+                    else:
+                        pred_mat[h_i, q_i] = _interp_quantile(q_val, r10, r50, r90)
 
         cone, summary = build_cone_and_summary(
             anchor_date=anchor_date,
@@ -618,10 +1033,11 @@ class MLStockBridge:
         batch_size: int = 128,
         refresh_data: bool = False,
         save_all_screened: bool = False,
+        model_run: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Executes ML_stock MarketScreener and persists the screening call and hit predictions."""
         t0 = time.time()
-        screener = self._ensure_screener()
+        screener, used_path, used_run_id = self._resolve_screener_and_run_id(model_run)
         u_clean = universe.lower().strip() or "all"
         top_n = max(1, min(100, int(top_n)))
         min_price = max(0.0, float(min_price))
@@ -750,9 +1166,10 @@ class MLStockBridge:
             interval=interval,
             total_candidates=len(tickers),
             total_screened=len(df_results),
-            checkpoint_path=str(self.checkpoint_path),
+            checkpoint_path=str(used_path),
             duration_sec=duration,
             results_payload=results_payload,
             hit_predictions=hit_predictions,
+            run_id=used_run_id,
         )
         return saved_run

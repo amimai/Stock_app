@@ -648,5 +648,140 @@ class TestDatabaseCRUD(unittest.TestCase):
         self.assertEqual(counts["tracked_stocks"], 1)
 
 
+class TestTrackedStocksColumnFilters(unittest.TestCase):
+    """Test suite for Table 1 column filters and 2d Median range/sorting."""
+
+    def test_static_index_html_filter_controls(self) -> None:
+        html_path = APP_ROOT / "static" / "index.html"
+        self.assertTrue(html_path.exists())
+        content = html_path.read_text(encoding="utf-8")
+
+        # Ticker & Name search inputs
+        self.assertIn('id="filterTrackedTicker"', content)
+        self.assertIn('id="filterTrackedName"', content)
+
+        # Sector dropdown
+        self.assertIn('id="filterTrackedSector"', content)
+
+        # Predictions / Hits and Latest Anchor dropdowns
+        self.assertIn('id="filterTrackedPredsHits"', content)
+        self.assertIn('id="filterTrackedAnchorDate"', content)
+
+        # 2d Median range & sort controls
+        self.assertIn('id="filterTracked2dRange"', content)
+        self.assertIn('id="filterTracked2dSort"', content)
+        self.assertIn('id="filterTracked2dMin"', content)
+        self.assertIn('id="filterTracked2dMax"', content)
+        self.assertIn('id="thTracked2dMedian"', content)
+
+        # 0.50% to 1.00% range option specifically present
+        self.assertIn("0.50% to 1.00%", content)
+
+        # Reset button
+        self.assertIn('id="btnClearTrackedFilters"', content)
+
+        # Point-in-Time Date inputs must use YYYY-MM-DD placeholder and wrapper
+        self.assertIn('id="detailAsOfDate"', content)
+        self.assertIn('placeholder="YYYY-MM-DD"', content)
+        self.assertIn('date-input-wrap', content)
+        self.assertIn('id="modalPredictAsOfDate"', content)
+        # Verify neither visible date input uses native type="date"
+        self.assertNotIn('<input type="date" id="detailAsOfDate"', content)
+        self.assertNotIn('<input type="date" id="modalPredictAsOfDate"', content)
+
+    def test_app_js_filter_functions(self) -> None:
+        js_path = APP_ROOT / "static" / "app.js"
+        self.assertTrue(js_path.exists())
+        content = js_path.read_text(encoding="utf-8")
+
+        self.assertIn("function setupDateInputWrappers(", content)
+        self.assertIn("function get2dMedianPct(", content)
+        self.assertIn("function populateTrackedFilterDropdowns(", content)
+        self.assertIn("function toggleSort2d(", content)
+        self.assertIn("function clearTrackedTableFilters(", content)
+        self.assertIn("filterTrackedTicker", content)
+        self.assertIn("filterTrackedName", content)
+        self.assertIn("filterTrackedSector", content)
+        self.assertIn("filterTracked2dRange", content)
+        self.assertIn("filterTracked2dSort", content)
+
+    def test_median_2d_return_math_and_filtering(self) -> None:
+        # Verify 2d return percentage calculation pct = (exp(cum2d_ret_50) - 1) * 100
+        def calc_pct(log_ret: float | None) -> float | None:
+            if log_ret is None or math.isnan(log_ret):
+                return None
+            return round((math.exp(log_ret) - 1.0) * 100.0, 4)
+
+        sample_stocks = [
+            {"ticker": "STOCK_A", "cum2d_ret_50": math.log(1.0 + 0.0075)},  # +0.75%
+            {"ticker": "STOCK_B", "cum2d_ret_50": math.log(1.0 + 0.0150)},  # +1.50%
+            {"ticker": "STOCK_C", "cum2d_ret_50": math.log(1.0 + 0.0050)},  # +0.50%
+            {"ticker": "STOCK_D", "cum2d_ret_50": math.log(1.0 + 0.0100)},  # +1.00%
+            {"ticker": "STOCK_E", "cum2d_ret_50": math.log(1.0 - 0.0050)},  # -0.50%
+            {"ticker": "STOCK_F", "cum2d_ret_50": None},
+        ]
+
+        # Filter for range 0.50% to 1.00%
+        hits = [
+            s
+            for s in sample_stocks
+            if (p := calc_pct(s["cum2d_ret_50"])) is not None and 0.50 <= p <= 1.00
+        ]
+        hit_tickers = {s["ticker"] for s in hits}
+        self.assertEqual(hit_tickers, {"STOCK_A", "STOCK_C", "STOCK_D"})
+
+        # Sort descending
+        hits_desc = sorted(hits, key=lambda s: calc_pct(s["cum2d_ret_50"]) or -999, reverse=True)
+        self.assertEqual([s["ticker"] for s in hits_desc], ["STOCK_D", "STOCK_A", "STOCK_C"])
+
+        # Sort ascending
+        hits_asc = sorted(hits, key=lambda s: calc_pct(s["cum2d_ret_50"]) or 999)
+        self.assertEqual([s["ticker"] for s in hits_asc], ["STOCK_C", "STOCK_A", "STOCK_D"])
+
+    def test_volatility_spread_and_quantile_bands(self) -> None:
+        """Tests that build_cone_and_summary correctly derives Core 50% spread and volatility spread."""
+        anchor_close = 150.0
+        milestones = [1, 2, 5, 20]
+        quantiles = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+        # Simulate log return predictions
+        # For 2d (index 1): q10 = -0.03, q25 = -0.01, q50 = +0.01, q75 = +0.03, q90 = +0.05
+        pred_rets = np.zeros((4, 7), dtype=np.float64)
+        pred_rets[1] = [-0.05, -0.03, -0.01, 0.01, 0.03, 0.05, 0.07]
+
+        cone, summary = build_cone_and_summary(
+            anchor_date="2026-10-16",
+            anchor_close=anchor_close,
+            milestones=milestones,
+            quantiles=quantiles,
+            pred_cum_returns=pred_rets,
+        )
+
+        # 2-day milestone check
+        m2 = cone["milestones"][1]
+        self.assertEqual(m2["horizon_days"], 2)
+        self.assertAlmostEqual(m2["returns"]["q25"], -0.01, places=5)
+        self.assertAlmostEqual(m2["returns"]["q75"], 0.03, places=5)
+        self.assertAlmostEqual(m2["spread_50"], 0.04, places=5)
+        self.assertAlmostEqual(m2["spread_80"], 0.08, places=5)
+
+        # Summary check
+        self.assertAlmostEqual(summary["cum2d_ret_25"], -0.01, places=5)
+        self.assertAlmostEqual(summary["cum2d_ret_75"], 0.03, places=5)
+        self.assertAlmostEqual(summary["volatility_spread_2d"], 0.08, places=5)
+
+        # Volatility filtering logic test
+        sample_stocks = [
+            {"ticker": "VOL_HIGH", "volatility_spread_2d": 0.085},  # 8.5%
+            {"ticker": "VOL_MID", "volatility_spread_2d": 0.045},   # 4.5%
+            {"ticker": "VOL_LOW", "volatility_spread_2d": 0.021},   # 2.1%
+        ]
+        high_vol = [s["ticker"] for s in sample_stocks if s["volatility_spread_2d"] * 100 > 6.0]
+        self.assertEqual(high_vol, ["VOL_HIGH"])
+
+        sorted_vol = sorted(sample_stocks, key=lambda s: s["volatility_spread_2d"], reverse=True)
+        self.assertEqual([s["ticker"] for s in sorted_vol], ["VOL_HIGH", "VOL_MID", "VOL_LOW"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
